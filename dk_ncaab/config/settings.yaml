@@ -1,0 +1,38 @@
+# ── Core settings ────────────────────────────────────────────────
+database:
+  url: "postgresql+psycopg2://dk:dk@localhost:5432/dk_ncaab"
+  echo: false            # SQLAlchemy SQL logging
+
+# ── API keys (override via env: DKNCAAB_ODDS_API__KEY) ──────────
+odds_api:
+  # key loaded from .env (DKNCAAB_ODDS_API__KEY)
+  base_url: "https://api.the-odds-api.com/v4"
+  sport: "basketball_ncaab"
+  bookmaker: "draftkings"
+  regions: "us"
+  markets: "h2h,spreads,totals"
+
+# ── Polling intervals (seconds) ─────────────────────────────────
+polling:
+  odds_baseline_sec: 300        # 5 min default
+  odds_pre90_sec: 90            # inside 90 min pre-tip
+  odds_pre30_sec: 60            # inside 30 min pre-tip
+  splits_baseline_sec: 1800     # 30 min default
+  splits_pre90_sec: 600         # inside 90 min pre-tip
+  results_sec: 300              # check scores every 5 min
+
+# ── Splits scraper ──────────────────────────────────────────────
+splits:
+  url: "https://www.actionnetwork.com/ncaab/public-betting"
+  headless: true
+  timeout_ms: 30000
+
+# ── Paths ────────────────────────────────────────────────────────
+storage:
+  raw_html_dir: "artifacts/raw_html"
+  screenshots_dir: "artifacts/screenshots"
+  parquet_dir: "artifacts/parquet"
+
+# ── Matching ─────────────────────────────────────────────────────
+matching:
+  time_tolerance_min: 15   # ±15 min for event matching

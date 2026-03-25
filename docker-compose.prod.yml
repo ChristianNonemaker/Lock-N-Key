@@ -1,0 +1,96 @@
+# ── Production Docker Compose (Oracle Cloud / any Linux VPS) ────
+#
+# Usage:
+#   cp .env.example .env   # fill in your real ODDS_API key
+#   docker compose -f docker-compose.prod.yml up -d
+#
+# This runs FOUR services:
+#   postgres  – database (persistent volume)
+#   daemon    – odds/ESPN/splits collector (APScheduler)
+#   api       – FastAPI read-only API
+#   ui        – Streamlit dashboard
+
+services:
+  # ── PostgreSQL ────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: dk_ncaab_pg
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5432:5432"      # only localhost, no public exposure
+    environment:
+      POSTGRES_USER: dk
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dk}
+      POSTGRES_DB: dk_ncaab
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dk -d dk_ncaab"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # ── Data collection daemon ────────────────────────────────────
+  daemon:
+    build: .
+    container_name: dk_ncaab_daemon
+    restart: unless-stopped
+    environment:
+      DKNCAAB_DATABASE__URL: "postgresql+psycopg2://dk:${POSTGRES_PASSWORD:-dk}@postgres:5432/dk_ncaab"
+      DKNCAAB_ODDS_API__KEY: "${ODDS_API_KEY}"
+      DKNCAAB_SPLITS__HEADLESS: "true"
+    command: >
+      sh -c "
+        python -m dk_ncaab db-init &&
+        alembic upgrade head &&
+        python -m dk_ncaab seed-teams &&
+        python -m dk_ncaab auto --budget 450
+      "
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - artifacts:/app/artifacts
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "5" }
+
+  # ── FastAPI (read-only API) ───────────────────────────────────
+  api:
+    build: .
+    container_name: dk_ncaab_api
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      DKNCAAB_DATABASE__URL: "postgresql+psycopg2://dk:${POSTGRES_PASSWORD:-dk}@postgres:5432/dk_ncaab"
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # ── Streamlit UI ──────────────────────────────────────────────
+  ui:
+    build: .
+    container_name: dk_ncaab_ui
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:8501:8501"        # public-facing (or put behind nginx)
+    environment:
+      API_BASE: "http://api:8000"
+    command: streamlit run ui/app.py --server.port 8501 --server.address 0.0.0.0
+    depends_on:
+      - api
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+volumes:
+  pgdata:
+  artifacts:
