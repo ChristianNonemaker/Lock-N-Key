@@ -1,13 +1,19 @@
 # ── Core settings ────────────────────────────────────────────────
 database:
-  url: "postgresql+psycopg2://dk:dk@localhost:5432/dk_ncaab"
+  url: "sqlite:///artifacts/dk_ncaab.sqlite3"
   echo: false            # SQLAlchemy SQL logging
 
 # ── API keys (override via env: DKNCAAB_ODDS_API__KEY) ──────────
 odds_api:
   # key loaded from .env (DKNCAAB_ODDS_API__KEY)
   base_url: "https://api.the-odds-api.com/v4"
-  sport: "basketball_ncaab"
+  # Legacy fallback. Default odds sports come from config/sports.py.
+  sport: "baseball_mlb"
+  monthly_request_budget: 500
+  reserve_requests: 50
+  max_sports_per_run: 1
+  min_interval_minutes: 360
+  max_request_attempts: 1
   bookmaker: "draftkings"
   regions: "us"
   markets: "h2h,spreads,totals"
@@ -21,11 +27,33 @@ polling:
   splits_pre90_sec: 600         # inside 90 min pre-tip
   results_sec: 300              # check scores every 5 min
 
+# ── Free ESPN schedule lookahead ───────────────────────────────
+schedule:
+  lookahead_days: 14
+  request_delay_sec: 0.25
+  # Default sports come from config/sports.py; set sports here only to override.
+
+# MLB Stats API team/player game logs. This does not use Odds API quota, but
+# keep historical fills bounded and polite.
+mlb_stats:
+  base_url: "https://statsapi.mlb.com/api/v1"
+  max_boxscores_per_run: 50
+  request_delay_sec: 0.1
+
 # ── Splits scraper ──────────────────────────────────────────────
 splits:
   url: "https://www.actionnetwork.com/ncaab/public-betting"
   headless: true
   timeout_ms: 30000
+  post_load_wait_ms: 2000
+  hard_timeout_sec: 45
+
+# API/private UI boundary
+api:
+  allowed_origins:
+    - "http://localhost:8501"
+    - "http://127.0.0.1:8501"
+    - "https://odds-vm.tail1282c7.ts.net"
 
 # ── Paths ────────────────────────────────────────────────────────
 storage:

@@ -95,27 +95,67 @@ class ModelResult:
 def temporal_cv_splits(
     df: pd.DataFrame,
     date_col: str = "start_time_utc",
+    group_col: str = "event_id",
     n_folds: int = 3,
     min_train_size: int = 100,
 ) -> list[tuple[pd.DataFrame, pd.DataFrame]]:
     """
-    Expanding-window temporal splits.
+    Expanding-window temporal splits that keep all rows for an event together.
     Returns list of (train_df, test_df) tuples, ordered by time.
     """
-    df = df.sort_values(date_col).reset_index(drop=True)
-    n = len(df)
-    fold_size = (n - min_train_size) // n_folds
+    df_sorted = df.sort_values(date_col, kind="mergesort")
+    if group_col not in df_sorted.columns:
+        n = len(df_sorted)
+        fold_size = (n - min_train_size) // n_folds
 
-    if fold_size < 20:
-        log.warning("Very small fold size (%d). Consider more data.", fold_size)
+        if fold_size < 20:
+            log.warning("Very small fold size (%d). Consider more data.", fold_size)
+
+        splits = []
+        for i in range(n_folds):
+            test_start = min_train_size + i * fold_size
+            test_end = test_start + fold_size if i < n_folds - 1 else n
+            train = df_sorted.iloc[:test_start]
+            test = df_sorted.iloc[test_start:test_end]
+            splits.append((train, test))
+        return splits
+
+    groups = (
+        df_sorted.groupby(group_col, sort=False)
+        .agg(first_date=(date_col, "min"), n_rows=(group_col, "size"))
+        .sort_values("first_date", kind="mergesort")
+    )
+    if len(groups) < 2:
+        return []
+
+    cumulative_rows = groups["n_rows"].cumsum()
+    train_candidates = np.flatnonzero(cumulative_rows.to_numpy() >= min_train_size)
+    if len(train_candidates):
+        min_train_groups = int(train_candidates[0]) + 1
+    else:
+        min_train_groups = max(1, len(groups) // 2)
+
+    remaining = len(groups) - min_train_groups
+    if remaining <= 0:
+        return []
+
+    fold_size = max(1, remaining // n_folds)
+    if fold_size < 3:
+        log.warning("Very small grouped fold size (%d events). Consider more data.", fold_size)
 
     splits = []
+    group_index = list(groups.index)
     for i in range(n_folds):
-        test_start = min_train_size + i * fold_size
-        test_end = test_start + fold_size if i < n_folds - 1 else n
-        train = df.iloc[:test_start]
-        test = df.iloc[test_start:test_end]
-        splits.append((train, test))
+        test_start = min_train_groups + i * fold_size
+        if test_start >= len(group_index):
+            break
+        test_end = test_start + fold_size if i < n_folds - 1 else len(group_index)
+        train_groups = set(group_index[:test_start])
+        test_groups = set(group_index[test_start:test_end])
+        train = df_sorted[df_sorted[group_col].isin(train_groups)]
+        test = df_sorted[df_sorted[group_col].isin(test_groups)]
+        if not test.empty:
+            splits.append((train, test))
 
     return splits
 
@@ -132,6 +172,37 @@ def _prepare_xy(
 
 
 # ── Ridge baseline ──────────────────────────────────────────────
+
+def fit_predict_oof_ridge(
+    df: pd.DataFrame,
+    features: list[str] | None = None,
+    target: str = TARGET,
+    n_folds: int = 3,
+    min_train_size: int = 100,
+    alpha: float = 1.0,
+) -> pd.Series:
+    """Return out-of-fold Ridge predictions aligned to the original index."""
+    feats = features or DEFAULT_FEATURES
+    preds = pd.Series(np.nan, index=df.index, dtype=float, name=f"oof_{target}")
+    splits = temporal_cv_splits(df, n_folds=n_folds, min_train_size=min_train_size)
+
+    for fold, (train_df, test_df) in enumerate(splits):
+        X_train, y_train = _prepare_xy(train_df, feats, target=target)
+        X_test, _ = _prepare_xy(test_df, feats, target=target)
+        if len(X_train) < 20 or len(X_test) < 1:
+            log.warning("OOF fold %d too small, skipping", fold)
+            continue
+
+        scaler = StandardScaler()
+        X_tr = scaler.fit_transform(X_train)
+        X_te = scaler.transform(X_test)
+
+        model = Ridge(alpha=alpha)
+        model.fit(X_tr, y_train)
+        preds.loc[X_test.index] = model.predict(X_te)
+
+    return preds
+
 
 def train_ridge(
     df: pd.DataFrame,

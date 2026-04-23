@@ -88,3 +88,5 @@ Write-Host "══════════════════════�
 Write-Host "  Deploy complete!"
 Write-Host "  UI: http://${VmIp}:8501"
 Write-Host "═══════════════════════════════════════════"
+# LEGACY: Docker/Oracle deploy helper. Production uses cron + systemd +
+# Tailscale Serve on the Debian VM; do not use this as the default deploy path.

@@ -17,6 +17,8 @@ import httpx
 import streamlit as st
 import pandas as pd
 
+from dk_ncaab.config.sports import ui_sport_choices
+
 _ET = ZoneInfo("America/New_York")
 
 
@@ -69,8 +71,35 @@ def _ou_emoji(result: str | None) -> str:
     return {"O": "⬆", "U": "⬇", "P": "➖"}.get(result, "")
 
 
+def _last_n_summary(final_games: list[dict], n: int = 10) -> tuple[str, str, str]:
+    recent = final_games[:n]
+    if not recent:
+        return "N/A", "N/A", "N/A"
+
+    su_w = sum(1 for g in recent if g.get("won"))
+    su = f"{su_w}-{len(recent) - su_w}"
+
+    ats_w = sum(1 for g in recent if g.get("spread_result") == "W")
+    ats_l = sum(1 for g in recent if g.get("spread_result") == "L")
+    ats_p = sum(1 for g in recent if g.get("spread_result") == "P")
+    ats = f"{ats_w}-{ats_l}-{ats_p}"
+
+    ou_o = sum(1 for g in recent if g.get("total_result") == "O")
+    ou_u = sum(1 for g in recent if g.get("total_result") == "U")
+    ou_p = sum(1 for g in recent if g.get("total_result") == "P")
+    ou = f"{ou_o}-{ou_u}-{ou_p}"
+
+    return su, ats, ou
+
+
 def render(api_base: str) -> None:
     st.header("🏀 Team History")
+
+    sport_filter = st.selectbox(
+        "Sport",
+        ui_sport_choices(),
+        format_func=lambda x: x[1],
+    )
 
     # Team search
     search = st.text_input("Search for a team", placeholder="e.g. Duke, Gonzaga, Kansas")
@@ -80,7 +109,11 @@ def render(api_base: str) -> None:
 
     # Fetch matching teams
     try:
-        resp = httpx.get(f"{api_base}/teams", params={"q": search}, timeout=10)
+        resp = httpx.get(
+            f"{api_base}/teams",
+            params={"q": search, "sport": sport_filter[0]},
+            timeout=10,
+        )
         resp.raise_for_status()
         teams_data = resp.json()
     except Exception as e:
@@ -117,6 +150,87 @@ def render(api_base: str) -> None:
     m1.metric("Record", history["record"])
     m2.metric("ATS Record", history["ats_record"])
     m3.metric("O/U Record", history["ou_record"])
+
+    with st.expander("⚔️ Team Matchup Lab (H2H + form)", expanded=False):
+        compare_search = st.text_input(
+            "Compare against",
+            placeholder="e.g. North Carolina",
+            key="team_compare_search",
+        )
+        if compare_search and len(compare_search) >= 2:
+            try:
+                cmp_resp = httpx.get(
+                    f"{api_base}/teams",
+                    params={"q": compare_search, "sport": sport_filter[0]},
+                    timeout=10,
+                )
+                cmp_resp.raise_for_status()
+                cmp_teams = [
+                    t for t in cmp_resp.json().get("teams", []) if int(t["id"]) != int(team_id)
+                ]
+            except Exception as e:
+                st.error(f"Comparison lookup failed: {e}")
+                cmp_teams = []
+
+            if cmp_teams:
+                cmp_options = {t["name"]: t["id"] for t in cmp_teams}
+                cmp_name = st.selectbox("Opponent", list(cmp_options.keys()), key="team_compare_opp")
+                opp_id = cmp_options[cmp_name]
+
+                try:
+                    opp_hist_resp = httpx.get(f"{api_base}/teams/{opp_id}/history", timeout=30)
+                    opp_hist_resp.raise_for_status()
+                    opp_history = opp_hist_resp.json()
+                except Exception as e:
+                    st.error(f"Opponent history error: {e}")
+                    opp_history = None
+
+                if opp_history:
+                    left, right = st.columns(2)
+                    with left:
+                        st.markdown(f"**{history['team']['name']}**")
+                        st.metric("Season SU", history["record"])
+                        st.metric("Season ATS", history["ats_record"])
+                        st.metric("Season O/U", history["ou_record"])
+                    with right:
+                        st.markdown(f"**{opp_history['team']['name']}**")
+                        st.metric("Season SU", opp_history["record"])
+                        st.metric("Season ATS", opp_history["ats_record"])
+                        st.metric("Season O/U", opp_history["ou_record"])
+
+                    team_final = [g for g in history.get("games", []) if g["status"] == "final"]
+                    opp_final = [g for g in opp_history.get("games", []) if g["status"] == "final"]
+
+                    lsu, lats, lou = _last_n_summary(team_final, n=10)
+                    rsu, rats, rou = _last_n_summary(opp_final, n=10)
+                    st.caption("Last 10 form")
+                    f1, f2, f3 = st.columns(3)
+                    f1.metric(f"{history['team']['name']} SU/ATS/O-U", f"{lsu} | {lats} | {lou}")
+                    f2.metric(f"{opp_history['team']['name']} SU/ATS/O-U", f"{rsu} | {rats} | {rou}")
+
+                    h2h_games = [
+                        g for g in team_final
+                        if int(g.get("opponent", {}).get("id", -1)) == int(opp_id)
+                    ]
+                    h2h_w = sum(1 for g in h2h_games if g.get("won"))
+                    h2h_l = len(h2h_games) - h2h_w
+                    h2h_ats_w = sum(1 for g in h2h_games if g.get("spread_result") == "W")
+                    h2h_ats_l = sum(1 for g in h2h_games if g.get("spread_result") == "L")
+                    h2h_ats_p = sum(1 for g in h2h_games if g.get("spread_result") == "P")
+                    h2h_ou_o = sum(1 for g in h2h_games if g.get("total_result") == "O")
+                    h2h_ou_u = sum(1 for g in h2h_games if g.get("total_result") == "U")
+                    h2h_ou_p = sum(1 for g in h2h_games if g.get("total_result") == "P")
+
+                    st.caption("Head-to-head (from selected team perspective)")
+                    h1, h2, h3 = st.columns(3)
+                    h1.metric("H2H SU", f"{h2h_w}-{h2h_l}")
+                    h2.metric("H2H ATS", f"{h2h_ats_w}-{h2h_ats_l}-{h2h_ats_p}")
+                    h3.metric("H2H O/U", f"{h2h_ou_o}-{h2h_ou_u}-{h2h_ou_p}")
+
+                    if h2h_games:
+                        st.caption(f"Last meeting: {_utc_to_et_date(h2h_games[0]['start_time_utc'])}")
+            else:
+                st.info("No comparison team found for that search.")
 
     st.markdown("---")
 

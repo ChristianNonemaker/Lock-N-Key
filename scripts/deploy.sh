@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# LEGACY: Docker/Oracle deploy helper. Production uses cron + systemd +
+# Tailscale Serve on the Debian VM; do not use this as the default deploy path.
 # ────────────────────────────────────────────────────────────────
 # DK NCAAB — Deploy / update to Oracle Cloud VM
 # ────────────────────────────────────────────────────────────────

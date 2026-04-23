@@ -26,6 +26,7 @@ from sklearn.metrics import (
 from sklearn.preprocessing import StandardScaler
 from sklearn.calibration import CalibratedClassifierCV
 
+from dk_ncaab.analysis.settlement import expected_value_units
 from dk_ncaab.analysis.models_close_predict import (
     temporal_cv_splits,
     FoldResult,
@@ -71,6 +72,26 @@ OUTCOME_FEATURES = [
     "deviation_x_public_extreme",
     "hmb_x_deviation",
 ]
+
+
+def _prepare_outcome_frame(
+    df: pd.DataFrame,
+    cols: list[str],
+    target_col: str,
+) -> tuple[pd.DataFrame, str, str]:
+    """Keep temporal/group metadata while filtering model-ready rows."""
+    meta_cols = [
+        col for col in ("event_id", "start_time_utc", "sport", "market", "side")
+        if col in df.columns
+    ]
+    keep_cols = list(dict.fromkeys([*cols, target_col, *meta_cols]))
+    sub = df[keep_cols].dropna(subset=[*cols, target_col]).copy()
+    date_col = "start_time_utc"
+    if date_col not in sub.columns:
+        date_col = "_row_order"
+        sub[date_col] = np.arange(len(sub))
+    group_col = "event_id" if "event_id" in sub.columns else "_missing_event_id"
+    return sub, date_col, group_col
 
 
 @dataclass
@@ -130,13 +151,13 @@ def train_outcome_model(
     """
     feats = features or OUTCOME_FEATURES
     cols = [c for c in feats if c in df.columns]
-    sub = df[cols + [target_col]].dropna()
+    sub, date_col, group_col = _prepare_outcome_frame(df, cols, target_col)
 
     if len(sub) < 50:
         log.warning("Too few rows for outcome model: %d", len(sub))
         return OutcomeModelResult(name="LogisticRegression", target_col=target_col, folds=[])
 
-    splits = temporal_cv_splits(sub, n_folds=n_folds)
+    splits = temporal_cv_splits(sub, date_col=date_col, group_col=group_col, n_folds=n_folds)
     fold_results: list[OutcomeFoldResult] = []
 
     for i, (train_df, test_df) in enumerate(splits):
@@ -206,13 +227,13 @@ def train_outcome_lgbm(
 
     feats = features or OUTCOME_FEATURES
     cols = [c for c in feats if c in df.columns]
-    sub = df[cols + [target_col]].dropna()
+    sub, date_col, group_col = _prepare_outcome_frame(df, cols, target_col)
 
     if len(sub) < 100:
         log.warning("Too few rows for LGBM outcome model: %d", len(sub))
         return OutcomeModelResult(name="LightGBM-Classifier", target_col=target_col, folds=[])
 
-    splits = temporal_cv_splits(sub, n_folds=n_folds)
+    splits = temporal_cv_splits(sub, date_col=date_col, group_col=group_col, n_folds=n_folds)
     fold_results: list[OutcomeFoldResult] = []
     importances: dict[str, float] = {}
 
@@ -345,9 +366,12 @@ def detect_mispricings(
         model_imp = predicted_close[idx]
         resid = market_imp - model_imp
 
-        # Break-even probability (at -110 juice, roughly implied / 1.05)
-        break_even = market_imp  # simplified: at entry price
-        model_ev = model_imp - break_even
+        price_col = f"price_american_{entry_anchor}"
+        price_american = df.loc[idx, price_col] if price_col in df.columns else None
+        if price_american is not None and not pd.isna(price_american):
+            model_ev = expected_value_units(float(model_imp), int(price_american))
+        else:
+            model_ev = model_imp - market_imp
 
         signals.append(MispricingSignal(
             event_id=int(df.loc[idx, "event_id"]),

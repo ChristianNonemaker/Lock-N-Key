@@ -1,20 +1,23 @@
 """
-CLI entrypoint — run with: python -m dk_ncaab <command>
+CLI entrypoint - run with: python -m dk_ncaab <command>
 
 Commands:
-  collect-odds      Run one odds collection cycle (1 API request)
+  collect-odds      Run one quota-gated odds collection cycle
+  collect-mlb-stats Collect MLB Stats API team/player logs (no odds quota)
   collect-splits    Run one splits scrape cycle
   collect-results   Run one results collection cycle (1 API request)
   load-games        Load games from ESPN for a date (FREE)
   update-results    Update all pending games with scores from ESPN (FREE)
   backfill          Backfill N days of games + scores from ESPN (FREE)
-  pipeline          Full daily pipeline: load→odds→update-results→build
+  pipeline          Full daily pipeline: load->odds->update-results->build
   auto              Smart auto-collector daemon (budget-aware)
   import-kenpom     Import KenPom ratings from CSV (§4)
   import-ap         Import AP rankings from CSV (§5)
   build-dataset     Build features and export to Parquet
   train             Train prediction models on collected data
   report            Generate correlation report
+  build-oof         Build local out-of-fold close-proxy artifacts
+  oof-entry-ev      Build strict OOF entry-EV artifacts
   backtest          Run backtest suite on historical data (§11)
   predict           Score upcoming games with trained models (§10.3)
   models            List saved trained models
@@ -44,32 +47,49 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
 
     # ── Data collectors ─────────────────────────────────────────
-    sub.add_parser("collect-odds", help="Run one odds collection cycle (1 API req)")
+    sub.add_parser("collect-odds", help="Run one quota-gated odds collection cycle")
+    mlb = sub.add_parser(
+        "collect-mlb-stats",
+        help="Collect MLB Stats API team/player logs (no odds quota)",
+    )
+    mlb.add_argument("--start-date", help="Start date YYYY-MM-DD, defaults to today")
+    mlb.add_argument("--end-date", help="End date YYYY-MM-DD")
+    mlb.add_argument("--days", type=int, default=1, help="Window length if --end-date omitted")
+    mlb.add_argument("--max-boxscores", type=int, help="Maximum boxscores to fetch this run")
+    mlb.add_argument("--request-delay-sec", type=float, help="Delay between boxscore requests")
+    mlb.add_argument(
+        "--include-unfinal",
+        action="store_true",
+        help="Fetch boxscores for non-final games too",
+    )
     sub.add_parser("collect-splits", help="Run one splits scrape cycle")
     sub.add_parser(
         "collect-results",
-        help="Fetch scores from Odds API (1 API req) — prefer update-results",
+        help="Fetch scores from Odds API (1 API req) - prefer update-results",
     )
 
     # ── ESPN-based (FREE, unlimited) ────────────────────────────
     lg = sub.add_parser("load-games", help="Load games from ESPN (FREE)")
     lg.add_argument("--date", help="Date YYYY-MM-DD, defaults to today")
+    lg.add_argument("--sport", help="Optional sport key, e.g. baseball_mlb")
 
-    sub.add_parser(
+    ur = sub.add_parser(
         "update-results",
         help="Update pending games with ESPN scores (FREE, no API cost)",
     )
+    ur.add_argument("--sport", help="Optional sport key, e.g. baseball_mlb")
 
     bf = sub.add_parser("backfill", help="Backfill N days from ESPN (FREE)")
     bf.add_argument(
         "--days", type=int, default=60,
         help="Number of days to backfill (default 60)",
     )
+    bf.add_argument("--sport", help="Optional sport key, e.g. baseball_mlb")
 
     # ── Pipeline (combines multiple steps) ──────────────────────
     pp = sub.add_parser(
         "pipeline",
-        help="Full cycle: load-games → collect-odds → update-results → build-dataset",
+        help="Full cycle: load-games -> collect-odds -> update-results -> build-dataset",
     )
     pp.add_argument(
         "--skip-odds", action="store_true",
@@ -86,9 +106,26 @@ def main() -> None:
     ap.add_argument("--date", help="Poll date YYYY-MM-DD, defaults to today")
 
     # ── Analysis ────────────────────────────────────────────────
-    sub.add_parser("build-dataset", help="Build features → Parquet")
+    sub.add_parser("build-dataset", help="Build features -> Parquet")
     sub.add_parser("train", help="Train prediction models on collected data")
     sub.add_parser("report", help="Generate correlation report")
+    oof = sub.add_parser("build-oof", help="Build local OOF close-proxy artifacts")
+    oof.add_argument(
+        "--source",
+        choices=["auto", "db", "latest-parquet"],
+        default="auto",
+        help="Feature source: DB first, DB only, or latest parquet",
+    )
+    oof.add_argument("--min-train-size", type=int, default=60)
+    oof.add_argument("--min-predictions", type=int, default=20)
+    ev_oof = sub.add_parser("oof-entry-ev", help="Build strict OOF entry-EV artifacts")
+    ev_oof.add_argument("--input-parquet", help="Feature parquet path")
+    ev_oof.add_argument("--from-db", action="store_true", help="Build features from local DB")
+    ev_oof.add_argument("--anchor", choices=["OPEN", "T60", "T30"], default="T60")
+    ev_oof.add_argument("--sport", default="basketball_ncaab")
+    ev_oof.add_argument("--out-dir", default="artifacts/entry_ev/oof")
+    ev_oof.add_argument("--min-train-size", type=int, default=60)
+    ev_oof.add_argument("--ev-threshold-units", type=float, default=0.0)
     sub.add_parser("backtest", help="Run backtest suite on collected data (§11)")
     sub.add_parser("predict", help="Score upcoming games with trained models")
     sub.add_parser("models", help="List saved trained models")
@@ -123,6 +160,22 @@ def main() -> None:
         from dk_ncaab.collectors.odds_api import collect_odds
         collect_odds()
 
+    elif args.command == "collect-mlb-stats":
+        from datetime import datetime as _dt
+        from dk_ncaab.collectors.mlb_stats import collect_mlb_stats
+
+        start = _dt.strptime(args.start_date, "%Y-%m-%d").date() if args.start_date else None
+        end = _dt.strptime(args.end_date, "%Y-%m-%d").date() if args.end_date else None
+        result = collect_mlb_stats(
+            start_date=start,
+            end_date=end,
+            days=args.days,
+            final_only=not args.include_unfinal,
+            max_boxscores=args.max_boxscores,
+            request_delay_sec=args.request_delay_sec,
+        )
+        print(result)
+
     elif args.command == "collect-splits":
         from dk_ncaab.collectors.splits_dknetwork import collect_splits
         collect_splits()
@@ -137,15 +190,15 @@ def main() -> None:
         if args.date:
             from datetime import datetime as _dt, timezone as _tz
             target = _dt.strptime(args.date, "%Y-%m-%d").replace(tzinfo=_tz.utc)
-        load_games_for_date(target)
+        load_games_for_date(target, sport=args.sport)
 
     elif args.command == "update-results":
         from dk_ncaab.collectors.load_games import update_scores_espn
-        update_scores_espn()
+        update_scores_espn(sport=args.sport)
 
     elif args.command == "backfill":
         from dk_ncaab.collectors.load_games import backfill_espn
-        backfill_espn(days=args.days)
+        backfill_espn(days=args.days, sport=args.sport)
 
     elif args.command == "pipeline":
         _run_pipeline(skip_odds=args.skip_odds)
@@ -179,6 +232,48 @@ def main() -> None:
             log.error("No data — run collectors first")
             sys.exit(1)
         generate_report(df)
+
+    elif args.command == "build-oof":
+        from dk_ncaab.analysis.oof_artifacts import generate_oof_artifacts
+
+        summary = generate_oof_artifacts(
+            source=args.source,
+            min_train_size=args.min_train_size,
+            min_predictions=args.min_predictions,
+        )
+        print(f"OOF artifact summary: rows={summary.rows} events={summary.events}")
+        for anchor in summary.anchors:
+            print(
+                f"  {anchor.anchor}: predictions={anchor.rows_with_prediction} "
+                f"bets={anchor.n_bets} roi={anchor.total_roi:+.2%}"
+            )
+            for warning in anchor.warnings:
+                print(f"    warning: {warning}")
+        for warning in summary.warnings:
+            print(f"  warning: {warning}")
+
+    elif args.command == "oof-entry-ev":
+        from dk_ncaab.analysis.oof_entry_ev import generate_oof_entry_ev
+
+        try:
+            result = generate_oof_entry_ev(
+                input_parquet=args.input_parquet,
+                from_db=args.from_db,
+                anchor=args.anchor,
+                sport=args.sport,
+                out_dir=args.out_dir,
+                min_train_size=args.min_train_size,
+                ev_threshold_units=args.ev_threshold_units,
+            )
+        except ValueError as exc:
+            log.error("OOF entry-EV artifact was not created: %s", exc)
+            sys.exit(1)
+        print(f"OOF entry-EV artifact: {result.run_dir}")
+        print(f"  predictions: {result.predictions_path}")
+        print(f"  rows_predicted: {result.summary['rows_predicted']}")
+        print(f"  recommended_count: {result.summary['recommended_count']}")
+        for warning in result.summary.get("warnings", []):
+            print(f"  warning: {warning}")
 
     elif args.command == "backtest":
         _run_backtest()
@@ -219,7 +314,7 @@ def _run_pipeline(skip_odds: bool = False) -> None:
     Full daily pipeline:
       1. load-games (ESPN, free) — seed today's games
       2. update-results (ESPN, free) — close out finished games w/ scores
-      3. collect-odds (Odds API, 1 request) — get DK lines for live games
+      3. collect-odds (Odds API, quota-gated) — get DK lines for live games
       4. build-dataset — export features to Parquet
     """
     log.info("═" * 60)
@@ -236,11 +331,11 @@ def _run_pipeline(skip_odds: bool = False) -> None:
     from dk_ncaab.collectors.load_games import update_scores_espn
     update_scores_espn()
 
-    # Step 3: Collect odds from Odds API (1 API request)
+    # Step 3: Collect odds from Odds API (quota-gated)
     if skip_odds:
         log.info("── Step 3/4: SKIPPED (--skip-odds) ──")
     else:
-        log.info("── Step 3/4: Collecting DK odds (1 API request) ──")
+        log.info("── Step 3/4: Collecting DK odds (quota-gated) ──")
         from dk_ncaab.collectors.odds_api import collect_odds
         collect_odds()
 
@@ -588,39 +683,42 @@ def _show_status() -> None:
         ap = session.query(APRanking).count()
 
     print()
-    print("╔══════════════════════════════════════════╗")
-    print("║     DK NCAAB Pipeline Status             ║")
-    print("╠══════════════════════════════════════════╣")
-    print(f"║  Teams:          {teams:>6}                  ║")
-    print(f"║  Events:         {events:>6}  (total)         ║")
-    print(f"║    upcoming:     {ev_upcoming:>6}                  ║")
-    print(f"║    live:         {ev_live:>6}                  ║")
-    print(f"║    final:        {ev_final:>6}                  ║")
-    print(f"║  Results:        {results:>6}  (scores)        ║")
-    print(f"║  Odds quotes:    {odds:>6}                  ║")
-    print(f"║  Splits quotes:  {splits:>6}                  ║")
-    print(f"║  KenPom ratings: {kenpom:>6}                  ║")
-    print(f"║  AP rankings:    {ap:>6}                  ║")
-    print("╠══════════════════════════════════════════╣")
+    print("+------------------------------------------+")
+    print("|     DK NCAAB Pipeline Status             |")
+    print("+------------------------------------------+")
+    print(f"|  Teams:          {teams:>6}                  |")
+    print(f"|  Events:         {events:>6}  (total)         |")
+    print(f"|    upcoming:     {ev_upcoming:>6}                  |")
+    print(f"|    live:         {ev_live:>6}                  |")
+    print(f"|    final:        {ev_final:>6}                  |")
+    print(f"|  Results:        {results:>6}  (scores)        |")
+    print(f"|  Odds quotes:    {odds:>6}                  |")
+    print(f"|  Splits quotes:  {splits:>6}                  |")
+    print(f"|  KenPom ratings: {kenpom:>6}                  |")
+    print(f"|  AP rankings:    {ap:>6}                  |")
+    print("+------------------------------------------+")
 
-    # Training readiness
-    events_w_results = results
-    events_w_odds = 0
-    if odds > 0:
-        with SessionLocal() as session:
-            events_w_odds = session.query(OddsQuote.event_id).distinct().count()
+    # Training readiness: settled events with at least one pregame odds quote.
+    with SessionLocal() as session:
+        trainable = (
+            session.query(Event.id)
+            .join(EventResult, EventResult.event_id == Event.id)
+            .join(OddsQuote, OddsQuote.event_id == Event.id)
+            .filter(Event.status == "final")
+            .filter(OddsQuote.collected_at_utc <= Event.start_time_utc)
+            .distinct()
+            .count()
+        )
+    status = "READY" if trainable >= 50 else f"Need {50 - trainable} more"
 
-    trainable = min(events_w_results, events_w_odds)
-    status = "✅ READY" if trainable >= 50 else f"⏳ Need {50 - trainable} more"
-
-    print(f"║  Trainable events: {trainable:>4}  {status:>13} ║")
-    print("╚══════════════════════════════════════════╝")
+    print(f"|  Trainable events: {trainable:>4}  {status:>13} |")
+    print("+------------------------------------------+")
     print()
 
     if trainable < 50:
         print("Next steps to get training-ready:")
         print("  1. python -m dk_ncaab backfill --days 60   (FREE, ~30s)")
-        print("  2. python -m dk_ncaab collect-odds          (1 API request)")
+        print("  2. python -m dk_ncaab collect-odds          (quota-gated)")
         print("  3. Repeat collect-odds a few times/day for odds history")
         print("  4. python -m dk_ncaab train                 (when ready)")
 

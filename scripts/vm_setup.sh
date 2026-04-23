@@ -11,6 +11,8 @@
 # ────────────────────────────────────────────────────────────────
 set -euo pipefail
 
+ALLOW_PUBLIC_UI="${DKNCAAB_ALLOW_PUBLIC_UI:-0}"
+
 echo "══════════════════════════════════════════════"
 echo "  DK NCAAB — VM Setup (Docker + Compose)"
 echo "══════════════════════════════════════════════"
@@ -47,12 +49,16 @@ echo "  Project directory: $PROJECT_DIR"
 
 # ── 5. Open firewall for Streamlit (port 8501) ─────────────────
 # Oracle Cloud uses iptables by default on Ubuntu images
-if sudo iptables -L INPUT -n | grep -q 8501; then
-    echo "  Port 8501 already open."
+if [[ "$ALLOW_PUBLIC_UI" == "1" ]]; then
+    if sudo iptables -L INPUT -n | grep -q 8501; then
+        echo "  Port 8501 already open."
+    else
+        echo "Opening port 8501 because DKNCAAB_ALLOW_PUBLIC_UI=1..."
+        sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 8501 -j ACCEPT
+        sudo netfilter-persistent save 2>/dev/null || true
+    fi
 else
-    echo "Opening port 8501..."
-    sudo iptables -I INPUT 6 -m state --state NEW -p tcp --dport 8501 -j ACCEPT
-    sudo netfilter-persistent save 2>/dev/null || true
+    echo "  Skipping public port 8501. Use Tailscale Serve for private UI access."
 fi
 
 echo ""
@@ -63,5 +69,6 @@ echo "  Next steps:"
 echo "    1. Log out and back in (for docker group)"
 echo "    2. Copy project files to $PROJECT_DIR/"
 echo "    3. Create .env file with your API key"
-echo "    4. docker compose -f docker-compose.prod.yml up -d"
+echo "    4. Preferred production: install cron + systemd + Tailscale Serve"
+echo "       Legacy only: docker compose -f docker-compose.prod.yml up -d"
 echo "══════════════════════════════════════════════"

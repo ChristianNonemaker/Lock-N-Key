@@ -155,16 +155,27 @@ def resolve_team(
     """
     norm = normalize_team_name(raw_name)
 
-    # 1. Check alias table (exact match on source + alias)
-    alias_row = session.execute(
-        select(TeamAlias).where(
-            TeamAlias.source == source,
+    # 1. Check alias table within the requested league. Also allow curated
+    # seed aliases for provider lookups so ESPN mascot names can resolve.
+    alias_sources = [source]
+    if source != "seed":
+        alias_sources.append("seed")
+    alias_rows = session.execute(
+        select(TeamAlias)
+        .join(Team, Team.id == TeamAlias.team_id)
+        .where(
+            Team.league_id == league_id,
+            TeamAlias.source.in_(alias_sources),
             TeamAlias.alias == norm,
         )
-    ).scalar_one_or_none()
+    ).scalars().all()
 
-    if alias_row:
-        return alias_row.team
+    if len(alias_rows) == 1:
+        team = alias_rows[0].team
+        if alias_rows[0].source != source:
+            session.add(TeamAlias(team_id=team.id, alias=norm, source=source))
+            session.flush()
+        return team
 
     # 2. Fall back to normalized_name on teams table
     team = session.execute(

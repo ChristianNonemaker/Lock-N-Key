@@ -5,7 +5,7 @@ Pydantic response schemas for the read-only API.
 from __future__ import annotations
 
 from datetime import datetime
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 # ── Game browser ────────────────────────────────────────────────
@@ -45,6 +45,61 @@ class GameListResponse(BaseModel):
     games: list[GameSummary]
 
 
+class BoardLineOption(BaseModel):
+    market: str
+    side: str
+    label: str
+    team_name: str | None = None
+    line: float | None = None
+    price_american: int | None = None
+    implied_probability: float | None = None
+    collected_at_utc: datetime | None = None
+    is_live: bool = False
+    is_stale: bool = True
+    open_line: float | None = None
+    open_price_american: int | None = None
+    implied_move_from_open: float | None = None
+    line_move_from_open: float | None = None
+
+
+class BoardSplitSummary(BaseModel):
+    market: str
+    side: str
+    bets_pct: float | None = None
+    handle_pct: float | None = None
+    collected_at_utc: datetime | None = None
+
+
+class BoardGame(BaseModel):
+    event_id: int
+    sport: str
+    league_key: str
+    start_time_utc: datetime
+    status: str
+    home_team: TeamOut
+    away_team: TeamOut
+    home_score: int | None = None
+    away_score: int | None = None
+    latest_quote_utc: datetime | None = None
+    odds_age_min: int | None = None
+    odds_stale: bool = True
+    lines: list[BoardLineOption]
+    split_summary: list[BoardSplitSummary]
+    markets_available: list[str]
+    flags: list[str]
+
+
+class BoardResponse(BaseModel):
+    generated_at_utc: datetime
+    sport: str
+    mode: str
+    date: str | None
+    count: int
+    games: list[BoardGame]
+    configured_sports: list[str]
+    warnings: list[str]
+
+
 # ── Team history ────────────────────────────────────────────────
 
 class TeamGameRow(BaseModel):
@@ -80,6 +135,26 @@ class TeamHistoryResponse(BaseModel):
 
 class TeamListResponse(BaseModel):
     teams: list[TeamOut]
+
+
+class StandingsRow(BaseModel):
+    team_id: int
+    team_name: str
+    wins: int
+    losses: int
+    win_pct: float
+    ats_wins: int
+    ats_losses: int
+    ats_pushes: int
+    ou_overs: int
+    ou_unders: int
+    ou_pushes: int
+
+
+class StandingsResponse(BaseModel):
+    sport: str
+    count: int
+    rows: list[StandingsRow]
 
 
 # ── Game detail ─────────────────────────────────────────────────
@@ -137,7 +212,103 @@ class GameDetailSummary(BaseModel):
     ap_rank_away: int | None = None
 
 
+class TeamResearchMetrics(BaseModel):
+    team: TeamOut
+    record: str
+    ats_record: str
+    ou_record: str
+    recent_games: list[TeamGameRow]
+
+
+class PlayerStatRow(BaseModel):
+    player_name: str
+    team_name: str | None = None
+    position: str | None = None
+    last_games: list[dict] = Field(default_factory=list)
+    note: str | None = None
+
+
+class GameResearchResponse(BaseModel):
+    event_id: int
+    sport: str
+    league_key: str
+    start_time_utc: datetime
+    status: str
+    home_team: TeamOut
+    away_team: TeamOut
+    home_score: int | None = None
+    away_score: int | None = None
+    latest_quote_utc: datetime | None = None
+    odds_age_min: int | None = None
+    odds_stale: bool = True
+    lines: list[BoardLineOption]
+    split_summary: list[BoardSplitSummary]
+    snapshots: dict[str, list[SnapshotOut]]
+    features: list[dict]
+    team_metrics: dict[str, TeamResearchMetrics]
+    player_stats: list[PlayerStatRow]
+    player_stats_note: str
+    warnings: list[str]
+
+
+class GameResearchBatchResponse(BaseModel):
+    generated_at_utc: datetime
+    count: int
+    events: list[GameResearchResponse]
+    warnings: list[str] = Field(default_factory=list)
+
+
 # ── Model panel ─────────────────────────────────────────────────
+
+class MlbStarterReadiness(BaseModel):
+    team_id: int
+    player_id: int | None = None
+    player_name: str | None = None
+    prior_starts: int = 0
+
+
+class MlbReadinessEvent(BaseModel):
+    event_id: int
+    start_time_utc: datetime
+    status: str
+    home_team: TeamOut
+    away_team: TeamOut
+    has_provider_key: bool
+    pregame_quote_count: int
+    has_pregame_odds: bool
+    home_team_logs_prior: int
+    away_team_logs_prior: int
+    home_starter: MlbStarterReadiness | None = None
+    away_starter: MlbStarterReadiness | None = None
+    both_probable_starters: bool
+    both_team_history: bool
+    both_starter_history: bool
+    ready_after_settlement: bool
+    gaps: list[str] = Field(default_factory=list)
+
+
+class MlbReadinessSummary(BaseModel):
+    sport: str
+    league_key: str
+    window_start_utc: datetime
+    window_end_utc: datetime
+    visible_events: int
+    events_with_provider_key: int
+    events_with_pregame_odds: int
+    events_with_both_probable_starters: int
+    events_with_both_team_history: int
+    events_with_both_starter_history: int
+    pending_pregame_events: int
+    settled_trainable_events: int
+    ready_after_settlement_events: int
+
+
+class MlbReadinessResponse(BaseModel):
+    generated_at_utc: datetime
+    summary: MlbReadinessSummary
+    events: list[MlbReadinessEvent]
+    warnings: list[str] = Field(default_factory=list)
+
 
 class ModelSignal(BaseModel):
     event_id: int
@@ -155,6 +326,50 @@ class ModelPanelResponse(BaseModel):
     signals: list[ModelSignal]
     features_used: list[str]
     model_name: str | None = None
+
+
+class OofAnchorSummary(BaseModel):
+    anchor: str
+    rows_input: int
+    rows_with_prediction: int
+    feature_count: int
+    artifact_path: str | None = None
+    n_bets: int
+    total_roi: float
+    mean_clv: float
+    settlement_by_sport_market: list[dict] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class OofArtifactSummaryResponse(BaseModel):
+    available: bool
+    generated_at_utc: str | None = None
+    source: str | None = None
+    dataset_path: str | None = None
+    rows: int = 0
+    events: int = 0
+    anchors: list[OofAnchorSummary] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class EntryEvArtifactLatestResponse(BaseModel):
+    available: bool
+    generated_at_utc: str | None = None
+    input_path: str | None = None
+    anchor: str | None = None
+    sport: str | None = None
+    model: str | None = None
+    rows_input: int = 0
+    rows_modelable: int = 0
+    rows_predicted: int = 0
+    events_modelable: int = 0
+    feature_count: int = 0
+    recommended_count: int = 0
+    recommended_profit_units: float = 0.0
+    recommended_roi: float = 0.0
+    mean_model_ev_units: float = 0.0
+    predictions_path: str | None = None
+    warnings: list[str] = Field(default_factory=list)
 
 
 # ── Backtest ────────────────────────────────────────────────────
@@ -191,3 +406,31 @@ class PipelineStatus(BaseModel):
     kenpom_ratings: int
     ap_rankings: int
     trainable_events: int
+    configured_sports: list[str]
+    odds_api_monthly_budget: int
+    odds_api_reserve_requests: int
+    odds_api_requests_recorded_month: int
+    odds_api_requests_used: int | None
+    odds_api_requests_remaining: int | None
+    odds_api_last_request_utc: datetime | None
+    odds_api_requests_by_sport: dict[str, int]
+    latest_odds_quote_utc: datetime | None
+    odds_data_age_min: int | None
+    odds_stale: bool
+    last_run_status: str | None
+    last_run_completed_utc: datetime | None
+    failed_runs_24h: int
+    odds_quotes_by_league: dict[str, int]
+
+
+class RunStepOut(BaseModel):
+    rc: int
+    duration_sec: int
+
+
+class IngestionRunOut(BaseModel):
+    run_id: str
+    started_at_utc: datetime
+    completed_at_utc: datetime
+    status: str
+    steps: dict[str, RunStepOut]

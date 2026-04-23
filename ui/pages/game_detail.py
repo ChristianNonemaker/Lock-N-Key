@@ -22,6 +22,8 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+from dk_ncaab.config.sports import ui_sport_choices
+
 _ET = ZoneInfo("America/New_York")
 
 _SIDE_COLORS = {
@@ -48,6 +50,37 @@ def _utc_to_et(iso_str: str) -> str:
 
 def render(api_base: str) -> None:
     st.header("🔍 Game Detail")
+
+    pick_col1, pick_col2 = st.columns(2)
+    with pick_col1:
+        sport_filter = st.selectbox(
+            "Sport",
+            ui_sport_choices(),
+            format_func=lambda x: x[1],
+            key="game_detail_sport",
+        )
+    with pick_col2:
+        selected_date = st.date_input("Date", key="game_detail_date")
+
+    try:
+        games_resp = httpx.get(
+            f"{api_base}/games",
+            params={"date": selected_date.strftime("%Y-%m-%d"), "sport": sport_filter[0]},
+            timeout=20,
+        )
+        games_resp.raise_for_status()
+        games_data = games_resp.json().get("games", [])
+    except Exception:
+        games_data = []
+
+    if games_data:
+        options = {
+            f"{g['away_team']['name']} @ {g['home_team']['name']} ({_utc_to_et(g['start_time_utc'])})": g["event_id"]
+            for g in games_data
+        }
+        selected_game = st.selectbox("Pick game", list(options.keys()), key="game_detail_picker")
+        if selected_game:
+            st.session_state["selected_event_id"] = options[selected_game]
 
     event_id = st.session_state.get("selected_event_id")
     manual_id = st.number_input("Event ID", value=event_id or 0, step=1, min_value=0)

@@ -323,18 +323,14 @@ def smart_cycle(
     should_collect = force_odds or _should_collect_odds(slate, budget)
 
     if should_collect:
-        log.info("── Odds API: Collecting DK lines (1 request) ──")
+        log.info("── Odds API: Collecting DK lines (quota-gated) ──")
         try:
-            from dk_ncaab.collectors.odds_api import (
-                collect_odds, last_api_remaining, last_api_used,
-            )
+            from dk_ncaab.collectors.odds_api import collect_odds
             n_quotes = collect_odds()
             summary["odds_collected"] = True
             summary["odds_quotes"] = n_quotes
 
-            # Read budget from the module-level vars set by _fetch_odds
-            from dk_ncaab.collectors import odds_api as _oa
-            budget.record_call(_oa.last_api_remaining, _oa.last_api_used)
+            _sync_budget_from_db(budget)
         except Exception:
             log.exception("Odds API collection failed")
     else:
@@ -607,23 +603,27 @@ def run_once(monthly_budget: int = 450) -> dict:
 
 def _sync_budget_from_db(budget: BudgetTracker):
     """
-    Estimate API usage this month by counting distinct collection
-    timestamps in odds_raw_payloads for the current month.
+    Sync API usage this month from the append-only odds_api_usage table.
     """
     now = datetime.now(timezone.utc)
-    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
     try:
-        from dk_ncaab.db.models import OddsRawPayload
-        from sqlalchemy import func
+        from dk_ncaab.collectors.odds_api import get_odds_usage_summary
         with SessionLocal() as session:
-            count = (
-                session.query(func.count(OddsRawPayload.id))
-                .filter(OddsRawPayload.collected_at_utc >= month_start)
-                .scalar()
-            ) or 0
-        budget._local_count = count
-        log.info("📊 Estimated %d API calls this month (from archive count)", count)
+            summary = get_odds_usage_summary(
+                session,
+                monthly_budget=budget.monthly_cap,
+                reserve_requests=0,
+                now=now,
+            )
+        budget._local_count = summary.recorded_requests_month
+        budget._api_remaining = summary.requests_remaining
+        budget._api_used = summary.requests_used
+        log.info(
+            "📊 Synced API usage: %d recorded, %s remaining",
+            summary.recorded_requests_month,
+            summary.requests_remaining,
+        )
     except Exception:
         log.warning("Could not sync budget from DB, using local count")
 

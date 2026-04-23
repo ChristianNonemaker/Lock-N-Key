@@ -21,6 +21,8 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
+from dk_ncaab.analysis.settlement import settle_profit_units
+
 log = logging.getLogger(__name__)
 
 
@@ -31,10 +33,14 @@ class BetRecord:
     side: str
     entry_anchor: str           # "T60" or "T30"
     entry_implied: float
+    entry_price_american: int | None
     close_implied: float
     clv: float                  # close - entry (positive = good)
     outcome: int | None         # 1=win, 0=loss, None=push/unknown
     payout: float | None        # +1 unit or -1 unit (flat bet)
+    settlement_status: str = "unknown"
+    sport: str | None = None
+    league_key: str | None = None
 
 
 @dataclass
@@ -63,34 +69,53 @@ class BacktestResult:
 
 # ── Strategy helpers ────────────────────────────────────────────
 
-def _compute_payout(entry_implied: float, outcome: int | None) -> float | None:
-    """Flat-bet payout: +decimal_odds - 1 if win, -1 if loss."""
-    if outcome is None:
-        return None
-    if outcome == 1:
-        # fair payout at entry price (before vig, simplified)
-        return (1 / entry_implied) - 1 if entry_implied > 0 else 0
-    return -1.0
+def _compute_payout(price_american: int | None, outcome: int | None) -> tuple[float | None, str]:
+    """Flat-bet payout using the actual entry American price."""
+    settled = settle_profit_units(price_american, outcome)
+    return settled.profit_units, settled.status
 
 
 def _build_bet(row: pd.Series, anchor: str) -> BetRecord | None:
     """Build a BetRecord from a feature row at the given anchor."""
     entry_col = f"implied_{anchor}"
+    price_col = f"price_american_{anchor}"
     entry_imp = row.get(entry_col)
+    price_american = row.get(price_col)
     close_imp = row.get("implied_CLOSE")
 
     if entry_imp is None or close_imp is None or np.isnan(entry_imp) or np.isnan(close_imp):
+        return None
+    if price_american is None or pd.isna(price_american):
         return None
 
     # Determine outcome based on market/side
     market = row.get("market", "")
     side = row.get("side", "")
+    final_known = row.get("home_win") is not None and not pd.isna(row.get("home_win"))
+    if market in {"spread", "total"}:
+        entry_line = row.get(f"line_{anchor}")
+        if entry_line is None or pd.isna(entry_line):
+            return None
     if market == "moneyline":
         outcome = row.get("home_win") if side == "home" else row.get("away_win")
     elif market == "spread":
-        outcome = row.get("spread_cover")
+        outcome_col = f"spread_cover_{anchor}"
+        if outcome_col in row.index:
+            outcome = row.get(outcome_col)
+        elif anchor == "OPEN" and "spread_cover_entry" in row.index:
+            outcome = row.get("spread_cover_entry")
+        elif anchor == "CLOSE" and "spread_cover" in row.index:
+            outcome = row.get("spread_cover")
+        else:
+            return None
     elif market == "total":
-        outcome = row.get("total_over")
+        outcome_col = f"total_over_{anchor}"
+        if outcome_col in row.index:
+            outcome = row.get(outcome_col)
+        elif anchor == "CLOSE" and "total_over" in row.index:
+            outcome = row.get("total_over")
+        else:
+            return None
     else:
         outcome = None
 
@@ -98,9 +123,11 @@ def _build_bet(row: pd.Series, anchor: str) -> BetRecord | None:
         outcome = int(outcome)
     else:
         outcome = None
+        if not (market in {"spread", "total"} and final_known):
+            return None
 
     clv = close_imp - entry_imp
-    payout = _compute_payout(entry_imp, outcome)
+    payout, settlement_status = _compute_payout(int(price_american), outcome)
 
     return BetRecord(
         event_id=int(row.get("event_id", 0)),
@@ -108,10 +135,14 @@ def _build_bet(row: pd.Series, anchor: str) -> BetRecord | None:
         side=side,
         entry_anchor=anchor,
         entry_implied=entry_imp,
+        entry_price_american=int(price_american),
         close_implied=close_imp,
         clv=clv,
         outcome=outcome,
         payout=payout,
+        settlement_status=settlement_status,
+        sport=row.get("sport"),
+        league_key=row.get("league_key"),
     )
 
 
@@ -172,6 +203,53 @@ def _aggregate_bets(strategy: str, bets: list[BetRecord]) -> BacktestResult:
     )
 
 
+def aggregate_bets(strategy: str, bets: list[BetRecord]) -> BacktestResult:
+    """Public wrapper for aggregating externally selected bet records."""
+    return _aggregate_bets(strategy, bets)
+
+
+def settlement_breakdown(
+    bets: list[BetRecord],
+    group_fields: tuple[str, ...] = ("sport", "market", "entry_anchor"),
+) -> list[dict[str, object]]:
+    """Return W/L/P/V counts and ROI grouped by sport, market, and entry anchor."""
+    buckets: dict[tuple[object, ...], dict[str, object]] = {}
+    for bet in bets:
+        key = tuple(getattr(bet, field, None) or "unknown" for field in group_fields)
+        bucket = buckets.setdefault(
+            key,
+            {
+                **dict(zip(group_fields, key, strict=True)),
+                "n_bets": 0,
+                "wins": 0,
+                "losses": 0,
+                "pushes": 0,
+                "voids": 0,
+                "unknown": 0,
+                "profit_units": 0.0,
+                "roi": 0.0,
+            },
+        )
+        bucket["n_bets"] = int(bucket["n_bets"]) + 1
+        status = bet.settlement_status or "unknown"
+        if status == "win":
+            bucket["wins"] = int(bucket["wins"]) + 1
+        elif status == "loss":
+            bucket["losses"] = int(bucket["losses"]) + 1
+        elif status == "push":
+            bucket["pushes"] = int(bucket["pushes"]) + 1
+        elif status == "void":
+            bucket["voids"] = int(bucket["voids"]) + 1
+        else:
+            bucket["unknown"] = int(bucket["unknown"]) + 1
+
+        if bet.payout is not None:
+            bucket["profit_units"] = float(bucket["profit_units"]) + float(bet.payout)
+        bucket["roi"] = float(bucket["profit_units"]) / int(bucket["n_bets"])
+
+    return list(buckets.values())
+
+
 # ── Strategies ──────────────────────────────────────────────────
 
 def backtest_blind(
@@ -229,6 +307,8 @@ def backtest_model_clv(
     """
     bets = []
     entry_col = f"implied_{anchor}"
+    if not predicted_close.index.equals(df.index):
+        raise ValueError("predicted_close must be aligned one-to-one with df.index")
 
     for idx, row in df.iterrows():
         entry_imp = row.get(entry_col)

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sportsbook UI Designer"
+  short_description: "Iterate polished private dashboard UI with screenshot checks."
+  default_prompt: "Use this skill to improve the private sportsbook dashboard UI with human-centered controls, responsive layouts, and screenshot-based verification."

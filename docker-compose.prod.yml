@@ -1,4 +1,10 @@
 # ── Production Docker Compose (Oracle Cloud / any Linux VPS) ────
+# Legacy Docker Compose profile.
+#
+# Preferred production runtime is SQLite + cron + systemd services bound to
+# localhost, published only through Tailscale Serve. Keep this file for
+# local/legacy experiments unless a future storage decision explicitly moves
+# production back to Postgres.
 #
 # Usage:
 #   cp .env.example .env   # fill in your real ODDS_API key
@@ -81,7 +87,7 @@ services:
     container_name: dk_ncaab_ui
     restart: unless-stopped
     ports:
-      - "0.0.0.0:8501:8501"        # public-facing (or put behind nginx)
+      - "127.0.0.1:8501:8501"      # localhost only; expose through Tailscale/reverse proxy
     environment:
       API_BASE: "http://api:8000"
     command: streamlit run ui/app.py --server.port 8501 --server.address 0.0.0.0

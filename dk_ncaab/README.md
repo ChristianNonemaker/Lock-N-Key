@@ -6,6 +6,10 @@ and identify value.
 
 ## Architecture
 
+Production foundation: SQLite on the private VM, cron one-shot collection,
+systemd API/UI services bound to `127.0.0.1`, and Tailscale Serve for remote
+access. Docker/Postgres/APScheduler paths remain legacy/dev alternatives.
+
 ```
 dk_ncaab/
 ├── collectors/          # Data ingestion
@@ -43,15 +47,13 @@ playwright install chromium
 ### 2. Configure
 Copy and edit settings:
 ```bash
-# Set your API key and DB URL via environment variables:
+# Set your API key via environment variables. SQLite is the VM default:
 export DKNCAAB_ODDS_API__KEY="your-api-key"
-export DKNCAAB_DATABASE__URL="postgresql+psycopg2://user:pass@localhost/dk_ncaab"
+export DKNCAAB_DATABASE__URL="sqlite:///artifacts/dk_ncaab.sqlite3"
 ```
 
 ### 3. Initialize database
 ```bash
-# Create the database first, then run migrations:
-createdb dk_ncaab
 alembic upgrade head
 ```
 
@@ -60,8 +62,8 @@ alembic upgrade head
 # One-shot:
 python -c "from dk_ncaab.collectors.odds_api import collect_odds; collect_odds()"
 
-# Scheduled:
-python -m dk_ncaab.jobs.scheduler
+# Production scheduled path:
+bash scripts/cron_collect_cycle.sh --project-dir "$PWD" --python-cmd .venv/bin/python
 ```
 
 ### 5. Build features + analyze
@@ -86,7 +88,7 @@ pytest tests/ -v
 
 | Variable | Description |
 |----------|-------------|
-| `DKNCAAB_DATABASE__URL` | Postgres connection string |
+| `DKNCAAB_DATABASE__URL` | SQLite production DB URL or optional dev Postgres URL |
 | `DKNCAAB_ODDS_API__KEY` | The-Odds-API key |
 | `DKNCAAB_SPLITS__HEADLESS` | `true`/`false` for Playwright |
 | `DKNCAAB_POLLING__ODDS_BASELINE_SEC` | Override polling interval |

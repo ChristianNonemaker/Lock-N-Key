@@ -1,10 +1,16 @@
+# Legacy/dev Docker Compose profile.
+#
+# Production uses SQLite + cron + systemd services on localhost, published only
+# through Tailscale Serve. This compose stack stays localhost-bound for local
+# experiments and should not be treated as the VM production runtime.
+
 services:
   postgres:
     image: postgres:16-alpine
     container_name: dk_ncaab_pg
     restart: unless-stopped
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     environment:
       POSTGRES_USER: dk
       POSTGRES_PASSWORD: dk
@@ -22,7 +28,7 @@ services:
     container_name: dk_ncaab_api
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
       DKNCAAB_DATABASE__URL: "postgresql+psycopg2://dk:dk@postgres:5432/dk_ncaab"
     command: uvicorn api.main:app --host 0.0.0.0 --port 8000
@@ -35,7 +41,7 @@ services:
     container_name: dk_ncaab_ui
     restart: unless-stopped
     ports:
-      - "8501:8501"
+      - "127.0.0.1:8501:8501"
     environment:
       API_BASE: "http://api:8000"
     command: streamlit run ui/app.py --server.port 8501 --server.address 0.0.0.0

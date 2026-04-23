@@ -74,6 +74,51 @@ class TeamAlias(Base):
     )
 
 
+class EventProviderKey(Base):
+    """Provider-specific event IDs without overwriting the primary event key."""
+
+    __tablename__ = "event_provider_keys"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_id: Mapped[int] = mapped_column(ForeignKey("events.id"), nullable=False)
+    sport_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider_event_key: Mapped[str] = mapped_column(String(256), nullable=False)
+    first_seen_at_utc: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    event: Mapped[Event] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint("provider", "provider_event_key", name="uq_event_provider_key"),
+        UniqueConstraint("event_id", "provider", name="uq_event_provider_by_event"),
+        Index("ix_event_provider_keys_event", "event_id"),
+    )
+
+
+class Player(Base):
+    """Provider-backed player identity for sport-specific logs."""
+
+    __tablename__ = "players"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    league_id: Mapped[int] = mapped_column(ForeignKey("leagues.id"), nullable=False)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    external_player_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    full_name: Mapped[str] = mapped_column(String(256), nullable=False)
+    primary_position: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    bats: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    throws: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
+    league: Mapped[League] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint("provider", "external_player_key", name="uq_player_provider_key"),
+        Index("ix_players_league_name", "league_id", "full_name"),
+    )
+
+
 # ── KenPom team ratings ──────────────────────────────────────────
 
 class KenPomRating(Base):
@@ -194,6 +239,28 @@ class OddsRawPayload(Base):
 
 # ── Splits (append-only) ───────────────────────────────────────
 
+class OddsApiUsage(Base):
+    __tablename__ = "odds_api_usage"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    requested_at_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    sport_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider_sport_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    endpoint: Mapped[str] = mapped_column(String(256), nullable=False)
+    request_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    success: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    requests_used: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    requests_remaining: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        Index("ix_odds_api_usage_sport_time", "sport_key", "requested_at_utc"),
+        Index("ix_odds_api_usage_requested_at", "requested_at_utc"),
+    )
+
+
 class SplitsQuote(Base):
     __tablename__ = "splits_quotes"
 
@@ -255,3 +322,126 @@ class EventResult(Base):
     )
 
     event: Mapped[Event] = relationship(back_populates="result")
+
+
+class MlbStatsRawPayload(Base):
+    """Raw MLB Stats API payload archive for lineage and replay."""
+
+    __tablename__ = "mlb_stats_raw_payloads"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    collected_at_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    endpoint: Mapped[str] = mapped_column(String(256), nullable=False)
+    provider_event_key: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    event_id: Mapped[int | None] = mapped_column(ForeignKey("events.id"), nullable=True)
+    payload_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        Index("ix_mlb_raw_event", "event_id"),
+        Index("ix_mlb_raw_provider_event", "provider_event_key"),
+    )
+
+
+class MlbTeamGameLog(Base):
+    """Final MLB team boxscore totals, one row per event/team."""
+
+    __tablename__ = "mlb_team_game_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_id: Mapped[int] = mapped_column(ForeignKey("events.id"), nullable=False)
+    team_id: Mapped[int] = mapped_column(ForeignKey("teams.id"), nullable=False)
+    game_date_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    is_home: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    opponent_team_id: Mapped[int] = mapped_column(ForeignKey("teams.id"), nullable=False)
+    runs_for: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    runs_against: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    hits: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    errors: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    at_bats: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    doubles: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    triples: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    home_runs: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    base_on_balls: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    strike_outs: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    stolen_bases: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    bullpen_outs: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    source: Mapped[str] = mapped_column(String(64), nullable=False, default="mlb_stats_api")
+
+    event: Mapped[Event] = relationship()
+    team: Mapped[Team] = relationship(foreign_keys=[team_id])
+    opponent: Mapped[Team] = relationship(foreign_keys=[opponent_team_id])
+
+    __table_args__ = (
+        UniqueConstraint("event_id", "team_id", name="uq_mlb_team_game_log"),
+        Index("ix_mlb_team_logs_team_date", "team_id", "game_date_utc"),
+    )
+
+
+class MlbPlayerGameLog(Base):
+    """Final MLB player boxscore totals, one row per event/player/team."""
+
+    __tablename__ = "mlb_player_game_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_id: Mapped[int] = mapped_column(ForeignKey("events.id"), nullable=False)
+    player_id: Mapped[int] = mapped_column(ForeignKey("players.id"), nullable=False)
+    team_id: Mapped[int] = mapped_column(ForeignKey("teams.id"), nullable=False)
+    game_date_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    is_home: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    batting_order: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    position_abbrev: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    batting_started: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    pitching_started: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    at_bats: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    runs: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    hits: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    doubles: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    triples: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    home_runs: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rbi: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    base_on_balls: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    strike_outs: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    stolen_bases: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    innings_pitched_outs: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    pitching_hits: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    pitching_runs: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    earned_runs: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    pitching_base_on_balls: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    pitching_strike_outs: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    pitching_home_runs: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    pitches_thrown: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    source: Mapped[str] = mapped_column(String(64), nullable=False, default="mlb_stats_api")
+
+    event: Mapped[Event] = relationship()
+    player: Mapped[Player] = relationship()
+    team: Mapped[Team] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint("event_id", "player_id", "team_id", name="uq_mlb_player_game_log"),
+        Index("ix_mlb_player_logs_player_date", "player_id", "game_date_utc"),
+        Index("ix_mlb_player_logs_team_date", "team_id", "game_date_utc"),
+    )
+
+
+class MlbProbableStarter(Base):
+    """MLB probable/confirmed starting pitcher context."""
+
+    __tablename__ = "mlb_probable_starters"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_id: Mapped[int] = mapped_column(ForeignKey("events.id"), nullable=False)
+    team_id: Mapped[int] = mapped_column(ForeignKey("teams.id"), nullable=False)
+    player_id: Mapped[int] = mapped_column(ForeignKey("players.id"), nullable=False)
+    is_home: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    collected_at_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    event: Mapped[Event] = relationship()
+    team: Mapped[Team] = relationship()
+    player: Mapped[Player] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint("event_id", "team_id", name="uq_mlb_probable_starter"),
+        Index("ix_mlb_probable_starters_event", "event_id"),
+    )

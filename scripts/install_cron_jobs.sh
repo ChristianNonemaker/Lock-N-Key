@@ -43,7 +43,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 */5 * * * * cd $PROJECT_DIR && /bin/bash scripts/cron_collect_cycle.sh --project-dir $PROJECT_DIR --python-cmd $PYTHON_CMD
 */5 * * * * cd $PROJECT_DIR && /bin/bash scripts/monitor_health.sh --project-dir $PROJECT_DIR --project-id odds-collector-prod
 15 3 * * * cd $PROJECT_DIR && /bin/bash scripts/prune_vm_data.sh
-45 3 * * * cd $PROJECT_DIR && /bin/bash scripts/backup_sqlite_to_gcs.sh
+45 3 * * * cd $PROJECT_DIR && /bin/bash scripts/backup_sqlite_to_gcs.sh --python-cmd $PYTHON_CMD
 @reboot cd $PROJECT_DIR && /bin/bash scripts/monitor_health.sh --project-dir $PROJECT_DIR --project-id odds-collector-prod --reboot-check
 EOF
 )

@@ -87,3 +87,15 @@ printf 'smtp.gmail.com' | gcloud secrets versions add ALERT_SMTP_HOST --data-fil
 printf 'your-smtp-user@gmail.com' | gcloud secrets versions add ALERT_SMTP_USER --data-file=-
 printf 'your-app-password' | gcloud secrets versions add ALERT_SMTP_PASS --data-file=-
 ```
+
+## 12) Persist API/UI with systemd (auto-restart + reboot-safe)
+```bash
+cd ~/dk_ncaab
+sudo bash scripts/install_systemd_services.sh --project-dir ~/dk_ncaab --run-user nonemakerc05
+sudo systemctl status dk-ncaab-api.service --no-pager
+sudo systemctl status dk-ncaab-ui.service --no-pager
+
+# Optional: verify private UI over Tailscale Serve
+curl -I http://127.0.0.1:8501
+curl -sSf http://127.0.0.1:8000/status | head -c 300
+```

@@ -3,7 +3,7 @@
 ## 1) Fixed Deployment Profile
 - Project: `odds-collector-prod`
 - Region/Zone: `us-central1` / `us-central1-a`
-- VM: `e2-micro`, Ubuntu 22.04 LTS, OS Login + IAM SSH
+- VM: `e2-micro`, Debian x86_64, OS Login + IAM SSH
 - Access model: private website only, authenticated, HTTPS, no anonymous/public API
 - Data store now: SQLite primary (simple + reliable), with migration path kept open for Postgres
 

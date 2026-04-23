@@ -5,6 +5,8 @@ __pycache__/
 dist/
 build/
 .eggs/
+.pytest_tmp/
+.test_tmp/
 
 # Env
 .env

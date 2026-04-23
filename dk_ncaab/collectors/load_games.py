@@ -23,18 +23,21 @@ import time
 from datetime import datetime, timezone, timedelta
 
 import httpx
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
+from dk_ncaab.config.settings import get_settings
+from dk_ncaab.config.sports import (
+    espn_scoreboard_params_for,
+    espn_scoreboard_url_for,
+    league_for_sport,
+    sport_for_league_key,
+)
 from dk_ncaab.db.models import League, Event, EventResult
 from dk_ncaab.db.session import SessionLocal
 from dk_ncaab.etl.normalize import resolve_team, get_or_create_team
 
 log = logging.getLogger(__name__)
-
-_ESPN_SCOREBOARD = (
-    "https://site.api.espn.com/apis/site/v2/sports/"
-    "basketball/mens-college-basketball/scoreboard"
-)
 
 # ESPN event status mapping
 _STATUS_MAP = {"pre": "upcoming", "in": "live", "post": "final"}
@@ -42,7 +45,10 @@ _STATUS_MAP = {"pre": "upcoming", "in": "live", "post": "final"}
 
 # ── Public entrypoints ──────────────────────────────────────────
 
-def load_games_for_date(target_date: datetime | None = None) -> int:
+def load_games_for_date(
+    target_date: datetime | None = None,
+    sport: str | None = None,
+) -> int:
     """
     Fetch the ESPN scoreboard for *target_date*, upsert events,
     and capture any completed scores.
@@ -54,12 +60,7 @@ def load_games_for_date(target_date: datetime | None = None) -> int:
     date_str = target_date.strftime("%Y%m%d")
     log.info("Loading games for %s from ESPN …", date_str)
 
-    espn_events = _fetch_espn_scoreboard(date_str)
-    if not espn_events:
-        log.warning("ESPN returned 0 events for %s", date_str)
-        return 0
-
-    log.info("ESPN returned %d events for %s", len(espn_events), date_str)
+    sports = _active_sports(sport)
 
     created = 0
     scores_added = 0
@@ -67,19 +68,26 @@ def load_games_for_date(target_date: datetime | None = None) -> int:
     failed = 0
 
     with SessionLocal() as session:
-        league = _ensure_league(session)
+        for sp in sports:
+            espn_events = _fetch_espn_scoreboard(date_str, sp)
+            if not espn_events:
+                log.warning("ESPN returned 0 events for %s [%s]", date_str, sp)
+                continue
 
-        for ev in espn_events:
-            try:
-                c, s, u = _process_espn_event(session, ev, league)
-                created += c
-                scores_added += s
-                status_updated += u
-            except Exception:
-                failed += 1
-                log.exception(
-                    "Failed to process ESPN event %s", ev.get("id", "?")
-                )
+            log.info("ESPN returned %d events for %s [%s]", len(espn_events), date_str, sp)
+            league = _ensure_league(session, sp)
+
+            for ev in espn_events:
+                try:
+                    c, s, u = _process_espn_event(session, ev, league, sp)
+                    created += c
+                    scores_added += s
+                    status_updated += u
+                except Exception:
+                    failed += 1
+                    log.exception(
+                        "Failed to process ESPN event %s [%s]", ev.get("id", "?"), sp
+                    )
 
         session.commit()
 
@@ -90,7 +98,45 @@ def load_games_for_date(target_date: datetime | None = None) -> int:
     return created
 
 
-def update_scores_espn() -> int:
+def load_games_window(
+    start_date: datetime | None = None,
+    days: int | None = None,
+    sport: str | None = None,
+) -> dict:
+    """
+    Load a forward ESPN schedule window.
+
+    This is free and is the normal cron path. It seeds upcoming slates before
+    any paid odds call runs, so the board can show games even when odds polling
+    is disabled or very low-frequency.
+    """
+    cfg = get_settings().schedule
+    if start_date is None:
+        start_date = datetime.now(timezone.utc)
+    if days is None:
+        days = cfg.lookahead_days
+    if days < 1:
+        raise ValueError("days must be >= 1")
+
+    summary = {"days": days, "total_created": 0}
+    log.info("Loading ESPN schedule window: start=%s days=%d", start_date.date(), days)
+
+    for offset in range(days):
+        target = start_date + timedelta(days=offset)
+        created = load_games_for_date(target, sport=sport)
+        summary["total_created"] += created
+        if offset < days - 1 and cfg.request_delay_sec > 0:
+            time.sleep(cfg.request_delay_sec)
+
+    log.info(
+        "Schedule window complete: %d new events across %d days",
+        summary["total_created"],
+        days,
+    )
+    return summary
+
+
+def update_scores_espn(sport: str | None = None) -> int:
     """
     Re-check every non-final event via ESPN and capture scores.
     Call this periodically (free!) to close out finished games.
@@ -101,7 +147,13 @@ def update_scores_espn() -> int:
     with SessionLocal() as session:
         pending = (
             session.query(Event)
-            .filter(Event.status.in_(["upcoming", "live"]))
+            .outerjoin(EventResult, EventResult.event_id == Event.id)
+            .filter(
+                or_(
+                    Event.status.in_(["upcoming", "live"]),
+                    EventResult.event_id.is_(None),
+                )
+            )
             .all()
         )
         if not pending:
@@ -110,27 +162,32 @@ def update_scores_espn() -> int:
 
         log.info("Checking %d pending events", len(pending))
 
-        # Group events by date to batch ESPN calls
-        dates: set[str] = set()
+        # Group events by sport/date to batch ESPN calls.
+        grouped_dates: dict[str, set[str]] = {}
         for e in pending:
-            dates.add(e.start_time_utc.strftime("%Y%m%d"))
+            sp = _sport_from_event(e)
+            if sport and sp != sport:
+                continue
+            grouped_dates.setdefault(sp, set()).add(e.start_time_utc.strftime("%Y%m%d"))
 
-        league = _ensure_league(session)
         scores_added = 0
         status_updated = 0
 
-        for date_str in sorted(dates):
-            espn_events = _fetch_espn_scoreboard(date_str)
-            for ev in espn_events:
-                try:
-                    _, s, u = _process_espn_event(session, ev, league)
-                    scores_added += s
-                    status_updated += u
-                except Exception:
-                    log.exception(
-                        "Score update failed for ESPN event %s",
-                        ev.get("id", "?"),
-                    )
+        for sp, dates in grouped_dates.items():
+            league = _ensure_league(session, sp)
+            for date_str in sorted(dates):
+                espn_events = _fetch_espn_scoreboard(date_str, sp)
+                for ev in espn_events:
+                    try:
+                        _, s, u = _process_espn_event(session, ev, league, sp)
+                        scores_added += s
+                        status_updated += u
+                    except Exception:
+                        log.exception(
+                            "Score update failed for ESPN event %s [%s]",
+                            ev.get("id", "?"),
+                            sp,
+                        )
 
         session.commit()
 
@@ -141,7 +198,7 @@ def update_scores_espn() -> int:
     return scores_added
 
 
-def backfill_espn(days: int = 30) -> dict:
+def backfill_espn(days: int = 30, sport: str | None = None) -> dict:
     """
     Backfill N days of historical games + scores from ESPN.
     Completely free — no Odds API calls used.
@@ -151,27 +208,30 @@ def backfill_espn(days: int = 30) -> dict:
     today = datetime.now(timezone.utc)
     summary = {"days": days, "total_created": 0, "total_scores": 0}
 
+    sports = _active_sports(sport)
+
     for offset in range(days, 0, -1):
         target = today - timedelta(days=offset)
         date_str = target.strftime("%Y%m%d")
 
         try:
-            espn_events = _fetch_espn_scoreboard(date_str)
-            if not espn_events:
-                continue
-
             created = 0
             scores = 0
 
             with SessionLocal() as session:
-                league = _ensure_league(session)
-                for ev in espn_events:
-                    try:
-                        c, s, _ = _process_espn_event(session, ev, league)
-                        created += c
-                        scores += s
-                    except Exception:
-                        pass
+                for sp in sports:
+                    espn_events = _fetch_espn_scoreboard(date_str, sp)
+                    if not espn_events:
+                        continue
+
+                    league = _ensure_league(session, sp)
+                    for ev in espn_events:
+                        try:
+                            c, s, _ = _process_espn_event(session, ev, league, sp)
+                            created += c
+                            scores += s
+                        except Exception:
+                            pass
                 session.commit()
 
             if created > 0 or scores > 0:
@@ -199,16 +259,17 @@ def backfill_espn(days: int = 30) -> dict:
 
 # ── ESPN API helpers ────────────────────────────────────────────
 
-def _fetch_espn_scoreboard(date_str: str) -> list[dict]:
+def _fetch_espn_scoreboard(date_str: str, sport: str) -> list[dict]:
     """Fetch ESPN scoreboard JSON for a YYYYMMDD date string, with retry.
 
     Catches *all* exceptions (including KeyboardInterrupt on Windows
     SSL timeouts) so that one bad date never crashes a full backfill.
     """
-    params = {"dates": date_str, "limit": 200, "groups": "50"}
+    params = _espn_scoreboard_params(date_str, sport)
+    scoreboard_url = espn_scoreboard_url_for(sport)
     for attempt in range(3):
         try:
-            resp = httpx.get(_ESPN_SCOREBOARD, params=params, timeout=60)
+            resp = httpx.get(scoreboard_url, params=params, timeout=60)
             resp.raise_for_status()
             return resp.json().get("events", [])
         except (KeyboardInterrupt, SystemExit):
@@ -234,11 +295,18 @@ def _fetch_espn_scoreboard(date_str: str) -> list[dict]:
             log.error("ESPN fetch failed for %s after 3 retries", date_str)
             return []
 
+    return []
 
-def _ensure_league(session: Session) -> League:
-    league = session.query(League).filter_by(key="ncaab").first()
+
+def _espn_scoreboard_params(date_str: str, sport: str) -> dict[str, str]:
+    return espn_scoreboard_params_for(sport, date_str)
+
+
+def _ensure_league(session: Session, sport: str) -> League:
+    league_key, league_name = league_for_sport(sport)
+    league = session.query(League).filter_by(key=league_key).first()
     if not league:
-        league = League(key="ncaab", name="NCAA Men's Basketball")
+        league = League(key=league_key, name=league_name)
         session.add(league)
         session.flush()
     return league
@@ -247,14 +315,18 @@ def _ensure_league(session: Session) -> League:
 # ── Event processing ────────────────────────────────────────────
 
 def _process_espn_event(
-    session: Session, ev: dict, league: League
+    session: Session,
+    ev: dict,
+    league: League,
+    sport: str,
 ) -> tuple[int, int, int]:
     """
     Process one ESPN event dict.
     Returns (created, score_added, status_updated) — each 0 or 1.
     """
     espn_id = str(ev["id"])
-    external_key = f"espn:{espn_id}"
+    # Backward-compatible for existing NCAAB rows.
+    external_key = f"espn:{espn_id}" if sport == "basketball_ncaab" else f"espn:{sport}:{espn_id}"
 
     # Parse competitors
     competitions = ev.get("competitions", [])
@@ -281,7 +353,7 @@ def _process_espn_event(
         if ha == "home":
             home_raw = name
             home_score_raw = score
-        else:
+        elif ha == "away":
             away_raw = name
             away_score_raw = score
 
@@ -314,7 +386,7 @@ def _process_espn_event(
     if existing:
         event = existing
         # Update status if it progressed
-        if event.status != db_status and db_status in ("live", "final"):
+        if event.status != "final" and event.status != db_status and db_status in ("live", "final"):
             event.status = db_status
             status_updated = 1
     else:
@@ -380,3 +452,25 @@ def _resolve_or_create(session: Session, raw_name: str, league_id: int):
     if team:
         return team
     return get_or_create_team(session, raw_name, source="espn", league_id=league_id)
+
+
+def _active_sports(sport: str | None) -> list[str]:
+    if sport:
+        espn_scoreboard_url_for(sport)
+        return [sport]
+
+    return get_settings().schedule.active_sports()
+
+
+def _sport_from_event(event: Event) -> str:
+    key = event.external_event_key or ""
+    if key.startswith("espn:"):
+        parts = key.split(":")
+        if len(parts) >= 3:
+            return parts[1]
+    if event.league and event.league.key:
+        try:
+            return sport_for_league_key(event.league.key)
+        except ValueError:
+            pass
+    return "basketball_ncaab"

@@ -1,5 +1,5 @@
 """
-Odds collector – polls The-Odds-API for DraftKings NCAAB markets.
+Odds collector - polls The-Odds-API for DraftKings markets.
 
 Responsibilities:
   1. Fetch upcoming events + odds (moneyline, spread, total).
@@ -16,17 +16,22 @@ import json
 import time
 import random
 import logging
+import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from dk_ncaab.config.settings import get_settings
+from dk_ncaab.config.sports import league_for_sport, odds_api_sport_for, validate_odds_sports
 from dk_ncaab.db.session import SessionLocal
 from dk_ncaab.db.models import (
-    League, Event, OddsQuote, OddsRawPayload,
+    League, Event, OddsQuote, OddsRawPayload, OddsApiUsage,
 )
 from dk_ncaab.etl.normalize import (
     american_to_implied,
@@ -34,6 +39,29 @@ from dk_ncaab.etl.normalize import (
 )
 
 log = logging.getLogger(__name__)
+
+_API_KEY_QUERY_RE = re.compile(r"apiKey=[^&\s\"]*")
+
+
+def _redact_api_key(value: object) -> object:
+    text = str(value)
+    redacted = _API_KEY_QUERY_RE.sub("apiKey=***", text)
+    return redacted if redacted != text else value
+
+
+class _ApiKeyRedactionFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = _redact_api_key(record.msg)
+        if isinstance(record.args, tuple):
+            record.args = tuple(_redact_api_key(arg) for arg in record.args)
+        elif isinstance(record.args, dict):
+            record.args = {key: _redact_api_key(value) for key, value in record.args.items()}
+        return True
+
+
+_httpx_logger = logging.getLogger("httpx")
+if not any(isinstance(f, _ApiKeyRedactionFilter) for f in _httpx_logger.filters):
+    _httpx_logger.addFilter(_ApiKeyRedactionFilter())
 
 # Last known API budget (updated on each successful fetch)
 last_api_remaining: int | None = None
@@ -46,15 +74,185 @@ _MARKET_MAP = {
 }
 
 
+@dataclass(frozen=True)
+class OddsUsageSummary:
+    monthly_budget: int
+    reserve_requests: int
+    recorded_requests_month: int
+    requests_used: int | None
+    requests_remaining: int | None
+    last_request_utc: datetime | None
+    requests_by_sport: dict[str, int]
+
+
+def _to_int(value: object) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _month_start(now: datetime) -> datetime:
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return datetime(now.year, now.month, 1, tzinfo=timezone.utc)
+
+
+def _ensure_aware(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def record_odds_api_usage(
+    *,
+    sport_key: str,
+    provider_sport_key: str,
+    endpoint: str,
+    requested_at_utc: datetime,
+    status_code: int | None,
+    success: bool,
+    requests_used: int | None = None,
+    requests_remaining: int | None = None,
+    error_type: str | None = None,
+    notes: str | None = None,
+) -> None:
+    """Persist one actual Odds API request attempt."""
+    try:
+        with SessionLocal() as session:
+            session.add(
+                OddsApiUsage(
+                    requested_at_utc=requested_at_utc,
+                    sport_key=sport_key,
+                    provider_sport_key=provider_sport_key,
+                    endpoint=endpoint,
+                    request_count=1,
+                    status_code=status_code,
+                    success=success,
+                    requests_used=requests_used,
+                    requests_remaining=requests_remaining,
+                    error_type=error_type,
+                    notes=notes,
+                )
+            )
+            session.commit()
+    except Exception:
+        log.exception("Failed to persist Odds API usage for %s", sport_key)
+
+
+def get_odds_usage_summary(
+    session: Session,
+    monthly_budget: int,
+    reserve_requests: int,
+    now: datetime | None = None,
+) -> OddsUsageSummary:
+    now = now or datetime.now(timezone.utc)
+    start = _month_start(now)
+
+    recorded = (
+        session.execute(
+            select(func.coalesce(func.sum(OddsApiUsage.request_count), 0))
+            .where(OddsApiUsage.requested_at_utc >= start)
+        ).scalar_one()
+        or 0
+    )
+
+    rows = session.execute(
+        select(
+            OddsApiUsage.sport_key,
+            func.coalesce(func.sum(OddsApiUsage.request_count), 0),
+        )
+        .where(OddsApiUsage.requested_at_utc >= start)
+        .group_by(OddsApiUsage.sport_key)
+    ).all()
+    by_sport = {sport: int(count or 0) for sport, count in rows}
+
+    latest = session.execute(
+        select(OddsApiUsage)
+        .where(OddsApiUsage.requested_at_utc >= start)
+        .order_by(OddsApiUsage.requested_at_utc.desc(), OddsApiUsage.id.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+
+    header_used = latest.requests_used if latest and latest.requests_used is not None else None
+    header_remaining = (
+        latest.requests_remaining
+        if latest and latest.requests_remaining is not None
+        else None
+    )
+    used = header_used if header_used is not None else int(recorded)
+    remaining = (
+        header_remaining
+        if header_remaining is not None
+        else max(monthly_budget - int(recorded), 0)
+    )
+
+    return OddsUsageSummary(
+        monthly_budget=monthly_budget,
+        reserve_requests=reserve_requests,
+        recorded_requests_month=int(recorded),
+        requests_used=used,
+        requests_remaining=remaining,
+        last_request_utc=_ensure_aware(latest.requested_at_utc) if latest else None,
+        requests_by_sport=by_sport,
+    )
+
+
+def select_due_odds_sports(
+    session: Session,
+    sports: list[str],
+    max_sports_per_run: int,
+    min_interval_minutes: int,
+    now: datetime | None = None,
+) -> list[str]:
+    """Choose due sports before making any HTTP calls."""
+    now = now or datetime.now(timezone.utc)
+    sports = validate_odds_sports(sports)
+    limit = max(0, int(max_sports_per_run))
+    if limit == 0 or not sports:
+        return []
+
+    latest_rows = session.execute(
+        select(OddsApiUsage.sport_key, func.max(OddsApiUsage.requested_at_utc))
+        .where(OddsApiUsage.sport_key.in_(sports))
+        .group_by(OddsApiUsage.sport_key)
+    ).all()
+    last_by_sport = {sport: _ensure_aware(last_seen) for sport, last_seen in latest_rows}
+    min_interval_sec = max(0, int(min_interval_minutes)) * 60
+
+    due: list[str] = []
+    for sport in sports:
+        last_seen = last_by_sport.get(sport)
+        if last_seen is None or (now - last_seen).total_seconds() >= min_interval_sec:
+            due.append(sport)
+
+    order = {sport: idx for idx, sport in enumerate(sports)}
+
+    def due_sort_key(sport: str) -> tuple[int, datetime, int]:
+        last_seen = last_by_sport.get(sport)
+        return (
+            0 if last_seen is None else 1,
+            last_seen or datetime.min.replace(tzinfo=timezone.utc),
+            order[sport],
+        )
+
+    return sorted(due, key=due_sort_key)[:limit]
+
 # ── HTTP helpers ────────────────────────────────────────────────
 
-def _fetch_odds(client: httpx.Client) -> dict:
+def _fetch_odds(client: httpx.Client, sport: str) -> dict:
     """
     GET /v4/sports/{sport}/odds from The-Odds-API.
     Returns raw JSON dict.  Logs remaining API quota from headers.
     """
     cfg = get_settings().odds_api
-    url = f"{cfg.base_url}/sports/{cfg.sport}/odds"
+    odds_sport = odds_api_sport_for(sport)
+    url = f"{cfg.base_url}/sports/{odds_sport}/odds"
+    endpoint = f"/sports/{odds_sport}/odds"
     params = {
         "apiKey": cfg.key,
         "regions": cfg.regions,
@@ -62,30 +260,55 @@ def _fetch_odds(client: httpx.Client) -> dict:
         "bookmakers": cfg.bookmaker,
         "oddsFormat": "american",
     }
-    resp = client.get(url, params=params, timeout=30)
-    resp.raise_for_status()
+    requested_at = datetime.now(timezone.utc)
+    try:
+        resp = client.get(url, params=params, timeout=30)
+    except httpx.RequestError as exc:
+        record_odds_api_usage(
+            sport_key=sport,
+            provider_sport_key=odds_sport,
+            endpoint=endpoint,
+            requested_at_utc=requested_at,
+            status_code=None,
+            success=False,
+            error_type=type(exc).__name__,
+            notes=str(exc)[:500],
+        )
+        raise
 
     # Track API budget from response headers
     global last_api_remaining, last_api_used
     remaining = resp.headers.get("x-requests-remaining")
     used = resp.headers.get("x-requests-used")
+    last_api_remaining = _to_int(remaining)
+    last_api_used = _to_int(used)
+    record_odds_api_usage(
+        sport_key=sport,
+        provider_sport_key=odds_sport,
+        endpoint=endpoint,
+        requested_at_utc=requested_at,
+        status_code=resp.status_code,
+        success=resp.is_success,
+        requests_used=last_api_used,
+        requests_remaining=last_api_remaining,
+        error_type=None if resp.is_success else "HTTPStatusError",
+    )
     if remaining is not None:
-        last_api_remaining = int(remaining)
-        last_api_used = int(used) if used else None
         log.info(
-            "📊 Odds API budget: %s used, %s remaining this month",
+            "Odds API budget: %s used, %s remaining this month",
             used or "?", remaining,
         )
+    resp.raise_for_status()
     return resp.json()
 
 
-def _fetch_with_backoff(client: httpx.Client, max_retries: int = 4) -> dict | None:
+def _fetch_with_backoff(client: httpx.Client, sport: str, max_retries: int = 4) -> dict | None:
     """Retry with exponential backoff + jitter on transient errors."""
     for attempt in range(max_retries):
         try:
-            return _fetch_odds(client)
+            return _fetch_odds(client, sport)
         except httpx.HTTPStatusError as e:
-            if e.response.status_code in (429, 500, 502, 503):
+            if e.response.status_code in (500, 502, 503):
                 wait = (2 ** attempt) + random.uniform(0, 1)
                 log.warning("HTTP %s, retrying in %.1fs (attempt %d)", e.response.status_code, wait, attempt + 1)
                 time.sleep(wait)
@@ -101,10 +324,11 @@ def _fetch_with_backoff(client: httpx.Client, max_retries: int = 4) -> dict | No
 
 # ── Parse + insert ──────────────────────────────────────────────
 
-def _ensure_league(session: Session) -> League:
-    league = session.query(League).filter_by(key="ncaab").first()
+def _ensure_league(session: Session, sport: str) -> League:
+    league_key, league_name = league_for_sport(sport)
+    league = session.query(League).filter_by(key=league_key).first()
     if not league:
-        league = League(key="ncaab", name="NCAA Men's Basketball")
+        league = League(key=league_key, name=league_name)
         session.add(league)
         session.flush()
     return league
@@ -233,9 +457,25 @@ def _insert_quotes(session: Session, rows: list[dict]) -> int:
     """Bulk insert with ON CONFLICT DO NOTHING (dedup)."""
     if not rows:
         return 0
-    stmt = pg_insert(OddsQuote).values(rows).on_conflict_do_nothing(
-        constraint="uq_odds_dedup"
-    )
+    dialect = session.get_bind().dialect.name
+    if dialect == "sqlite":
+        stmt = sqlite_insert(OddsQuote).values(rows).on_conflict_do_nothing(
+            index_elements=[
+                "event_id",
+                "book",
+                "market",
+                "side",
+                "price_american",
+                "line",
+                "collected_at_utc",
+            ]
+        )
+    elif dialect == "postgresql":
+        stmt = pg_insert(OddsQuote).values(rows).on_conflict_do_nothing(
+            constraint="uq_odds_dedup"
+        )
+    else:
+        raise RuntimeError(f"Unsupported odds insert dialect: {dialect}")
     result = session.execute(stmt)
     return result.rowcount  # type: ignore[return-value]
 
@@ -252,32 +492,86 @@ def _archive_raw(session: Session, payload: list | dict, collected_at: datetime)
 
 def collect_odds() -> int:
     """
-    Single poll cycle: fetch → parse → insert → archive.
+    Single poll cycle: fetch -> parse -> insert -> archive.
     Call this on a schedule (see jobs/scheduler.py).
     Returns count of newly inserted quote rows.
     """
     log.info("Starting odds collection cycle")
 
-    with httpx.Client() as client:
-        data = _fetch_with_backoff(client)
-
-    if data is None:
-        log.error("Odds fetch returned None, skipping cycle")
+    cfg = get_settings().odds_api
+    if not cfg.key.strip():
+        log.warning("Odds API key is not configured; skipping odds collection")
         return 0
 
-    collected_at = datetime.now(timezone.utc)
-
+    configured_sports = validate_odds_sports(cfg.active_sports())
     with SessionLocal() as session:
-        league = _ensure_league(session)
+        usage = get_odds_usage_summary(
+            session,
+            monthly_budget=cfg.monthly_request_budget,
+            reserve_requests=cfg.reserve_requests,
+        )
+        if usage.requests_remaining is not None and usage.requests_remaining <= cfg.reserve_requests:
+            log.warning(
+                "Odds API budget reserve reached: %s remaining, reserve=%s; skipping",
+                usage.requests_remaining,
+                cfg.reserve_requests,
+            )
+            return 0
+        budget_limited_max = min(
+            cfg.max_sports_per_run,
+            max((usage.requests_remaining or 0) - cfg.reserve_requests, 0),
+        )
+        sports = select_due_odds_sports(
+            session,
+            configured_sports,
+            max_sports_per_run=budget_limited_max,
+            min_interval_minutes=cfg.min_interval_minutes,
+        )
 
-        total_inserted = 0
-        for api_event in data:
-            event = _upsert_event(session, league, api_event)
-            rows = _parse_outcomes(api_event, event, collected_at)
-            total_inserted += _insert_quotes(session, rows)
+    if not sports:
+        log.info(
+            "No odds sports due; configured=%s max_sports_per_run=%s min_interval_minutes=%s",
+            configured_sports,
+            cfg.max_sports_per_run,
+            cfg.min_interval_minutes,
+        )
+        return 0
 
-        _archive_raw(session, data, collected_at)
-        session.commit()
+    total_inserted = 0
+    with httpx.Client() as client:
+        with SessionLocal() as session:
+            for sport in sports:
+                data = _fetch_with_backoff(
+                    client,
+                    sport,
+                    max_retries=max(1, int(cfg.max_request_attempts)),
+                )
+                if data is None:
+                    log.error("Odds fetch returned None for %s, skipping sport", sport)
+                    continue
 
-    log.info("Odds cycle complete: %d new quote rows", total_inserted)
+                collected_at = datetime.now(timezone.utc)
+                league = _ensure_league(session, sport)
+
+                inserted_for_sport = 0
+                for api_event in data:
+                    event = _upsert_event(session, league, api_event)
+                    rows = _parse_outcomes(api_event, event, collected_at)
+                    inserted_for_sport += _insert_quotes(session, rows)
+
+                _archive_raw(
+                    session,
+                    {"sport": sport, "events": data},
+                    collected_at,
+                )
+                total_inserted += inserted_for_sport
+                log.info(
+                    "Odds %s cycle complete: %d new quote rows",
+                    sport,
+                    inserted_for_sport,
+                )
+
+            session.commit()
+
+    log.info("Odds multi-sport cycle complete: %d new quote rows", total_inserted)
     return total_inserted

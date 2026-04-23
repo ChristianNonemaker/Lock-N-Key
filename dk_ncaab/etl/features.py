@@ -26,6 +26,7 @@ import numpy as np
 from sqlalchemy import select, and_
 from sqlalchemy.orm import Session
 
+from dk_ncaab.config.sports import sport_for_league_key
 from dk_ncaab.db.models import OddsQuote, Event, EventResult
 from dk_ncaab.etl.snapshots import (
     get_snapshot_set,
@@ -46,6 +47,8 @@ class FeatureRow:
     market: str
     side: str
     start_time_utc: datetime | None = None
+    sport: str | None = None
+    league_key: str | None = None
 
     # Implied probabilities at anchors
     implied_OPEN: float | None = None
@@ -58,6 +61,12 @@ class FeatureRow:
     line_T60: float | None = None
     line_T30: float | None = None
     line_CLOSE: float | None = None
+
+    # American prices at anchors
+    price_american_OPEN: int | None = None
+    price_american_T60: int | None = None
+    price_american_T30: int | None = None
+    price_american_CLOSE: int | None = None
 
     # Vig-removed fair implied probabilities at anchors
     fair_implied_OPEN: float | None = None
@@ -164,6 +173,32 @@ class FeatureRow:
     # Context
     hours_before_tip_at_OPEN: float | None = None
 
+    # MLB team/player trend features. All are computed from games before this
+    # event start time.
+    home_mlb_win_pct_l10: float | None = None
+    away_mlb_win_pct_l10: float | None = None
+    mlb_win_pct_delta_l10: float | None = None
+    home_mlb_runs_for_l5: float | None = None
+    away_mlb_runs_for_l5: float | None = None
+    home_mlb_runs_allowed_l5: float | None = None
+    away_mlb_runs_allowed_l5: float | None = None
+    home_mlb_run_diff_l5: float | None = None
+    away_mlb_run_diff_l5: float | None = None
+    mlb_run_diff_delta_l5: float | None = None
+    home_mlb_bullpen_outs_l3: float | None = None
+    away_mlb_bullpen_outs_l3: float | None = None
+    mlb_bullpen_outs_delta_l3: float | None = None
+    home_mlb_rest_days: float | None = None
+    away_mlb_rest_days: float | None = None
+    home_mlb_starter_era_l3: float | None = None
+    away_mlb_starter_era_l3: float | None = None
+    home_mlb_starter_whip_l3: float | None = None
+    away_mlb_starter_whip_l3: float | None = None
+    home_mlb_starter_k_bb_l3: float | None = None
+    away_mlb_starter_k_bb_l3: float | None = None
+    home_mlb_starter_avg_ip_l3: float | None = None
+    away_mlb_starter_avg_ip_l3: float | None = None
+
     # ── Model expected value (§9) ──────────────────────────────
     model_expected_value: float | None = None  # model_prob - break_even_prob (filled post-model)
 
@@ -172,7 +207,15 @@ class FeatureRow:
     away_win: int | None = None
     spread_cover: int | None = None     # 1=covered, 0=not, using closing spread
     spread_cover_entry: int | None = None  # cover using entry spread (not just closing)
+    spread_cover_OPEN: int | None = None
+    spread_cover_T60: int | None = None
+    spread_cover_T30: int | None = None
+    spread_cover_CLOSE: int | None = None
     total_over: int | None = None       # 1=over, 0=under
+    total_over_OPEN: int | None = None
+    total_over_T60: int | None = None
+    total_over_T30: int | None = None
+    total_over_CLOSE: int | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -255,6 +298,12 @@ def build_features(
     start = event.start_time_utc if event else None
 
     row = FeatureRow(event_id=event_id, market=market, side=side, start_time_utc=start)
+    if event and event.league:
+        row.league_key = event.league.key
+        try:
+            row.sport = sport_for_league_key(event.league.key)
+        except ValueError:
+            row.sport = event.league.key
 
     # ── Odds snapshots ──────────────────────────────────────────
     ss = get_snapshot_set(session, event_id, market, side)
@@ -265,6 +314,7 @@ def build_features(
         if snap:
             setattr(row, f"implied_{anchor_name}", snap.implied_probability)
             setattr(row, f"line_{anchor_name}", snap.line)
+            setattr(row, f"price_american_{anchor_name}", snap.price_american)
 
     # ── Vig-removed fair probabilities ──────────────────────────
     # Query the opposite side at each anchor to normalize the overround.
@@ -306,6 +356,8 @@ def build_features(
     # Hours before tip at OPEN
     if ss.OPEN and start:
         row.hours_before_tip_at_OPEN = _hours_between(ss.OPEN.collected_at_utc, start)
+
+    _fill_mlb_features(session, row, event, _entry_as_of_time(ss, start))
 
     # ── Volatility ──────────────────────────────────────────────
     if start:
@@ -493,8 +545,128 @@ def _fill_interactions(row: FeatureRow) -> None:
         row.hmb_x_deviation = row.handle_minus_bets_T60 * row.spread_dev_T60
 
 
+def _avg(values: Sequence[float | int | None]) -> float | None:
+    nums = [float(v) for v in values if v is not None]
+    return float(sum(nums) / len(nums)) if nums else None
+
+
+def _days_between(later: datetime | None, earlier: datetime | None) -> float | None:
+    if later is None or earlier is None:
+        return None
+    if later.tzinfo is not None and earlier.tzinfo is None:
+        earlier = earlier.replace(tzinfo=later.tzinfo)
+    elif later.tzinfo is None and earlier.tzinfo is not None:
+        later = later.replace(tzinfo=earlier.tzinfo)
+    return (later - earlier).total_seconds() / 86400
+
+
+def _entry_as_of_time(ss: SnapshotSet, fallback: datetime | None) -> datetime | None:
+    for snap in (ss.OPEN, ss.T60, ss.T30):
+        if snap is not None:
+            return snap.collected_at_utc
+    return fallback
+
+
+def _fill_mlb_features(
+    session: Session,
+    row: FeatureRow,
+    event: Event | None,
+    as_of_utc: datetime | None,
+) -> None:
+    """Populate MLB rolling team and starting-pitcher features without leakage."""
+    if not event or row.sport != "baseball_mlb" or as_of_utc is None:
+        return
+
+    from dk_ncaab.db.models import (
+        MlbPlayerGameLog,
+        MlbProbableStarter,
+        MlbTeamGameLog,
+    )
+
+    start = event.start_time_utc
+
+    def team_logs(team_id: int, limit: int) -> list[MlbTeamGameLog]:
+        stmt = (
+            select(MlbTeamGameLog)
+            .where(
+                MlbTeamGameLog.team_id == team_id,
+                MlbTeamGameLog.event_id != event.id,
+                MlbTeamGameLog.game_date_utc < as_of_utc,
+            )
+            .order_by(MlbTeamGameLog.game_date_utc.desc(), MlbTeamGameLog.id.desc())
+            .limit(limit)
+        )
+        return list(session.execute(stmt).scalars())
+
+    def set_team_side(prefix: str, team_id: int) -> None:
+        logs5 = team_logs(team_id, 5)
+        logs10 = team_logs(team_id, 10)
+        runs_for = _avg([g.runs_for for g in logs5])
+        runs_allowed = _avg([g.runs_against for g in logs5])
+        setattr(row, f"{prefix}_mlb_runs_for_l5", runs_for)
+        setattr(row, f"{prefix}_mlb_runs_allowed_l5", runs_allowed)
+        if runs_for is not None and runs_allowed is not None:
+            setattr(row, f"{prefix}_mlb_run_diff_l5", runs_for - runs_allowed)
+        wins = [
+            1.0 if g.runs_for is not None and g.runs_against is not None and g.runs_for > g.runs_against else 0.0
+            for g in logs10
+            if g.runs_for is not None and g.runs_against is not None
+        ]
+        setattr(row, f"{prefix}_mlb_win_pct_l10", _avg(wins))
+        setattr(row, f"{prefix}_mlb_bullpen_outs_l3", _avg([g.bullpen_outs for g in logs5[:3]]))
+        if logs5:
+            setattr(row, f"{prefix}_mlb_rest_days", _days_between(start, logs5[0].game_date_utc))
+
+    set_team_side("home", event.home_team_id)
+    set_team_side("away", event.away_team_id)
+
+    if row.home_mlb_win_pct_l10 is not None and row.away_mlb_win_pct_l10 is not None:
+        row.mlb_win_pct_delta_l10 = row.home_mlb_win_pct_l10 - row.away_mlb_win_pct_l10
+    if row.home_mlb_run_diff_l5 is not None and row.away_mlb_run_diff_l5 is not None:
+        row.mlb_run_diff_delta_l5 = row.home_mlb_run_diff_l5 - row.away_mlb_run_diff_l5
+    if row.home_mlb_bullpen_outs_l3 is not None and row.away_mlb_bullpen_outs_l3 is not None:
+        row.mlb_bullpen_outs_delta_l3 = row.home_mlb_bullpen_outs_l3 - row.away_mlb_bullpen_outs_l3
+
+    def set_starter_side(prefix: str, team_id: int) -> None:
+        starter = session.execute(
+            select(MlbProbableStarter).where(
+                MlbProbableStarter.event_id == event.id,
+                MlbProbableStarter.team_id == team_id,
+            )
+        ).scalar_one_or_none()
+        if starter is None:
+            return
+        stmt = (
+            select(MlbPlayerGameLog)
+            .where(
+                MlbPlayerGameLog.player_id == starter.player_id,
+                MlbPlayerGameLog.pitching_started.is_(True),
+                MlbPlayerGameLog.game_date_utc < as_of_utc,
+            )
+            .order_by(MlbPlayerGameLog.game_date_utc.desc(), MlbPlayerGameLog.id.desc())
+            .limit(3)
+        )
+        logs = list(session.execute(stmt).scalars())
+        outs = [g.innings_pitched_outs for g in logs if g.innings_pitched_outs]
+        total_outs = sum(outs)
+        total_ip = total_outs / 3 if total_outs else None
+        er = sum(g.earned_runs or 0 for g in logs)
+        hits = sum(g.pitching_hits or 0 for g in logs)
+        walks = sum(g.pitching_base_on_balls or 0 for g in logs)
+        strikeouts = sum(g.pitching_strike_outs or 0 for g in logs)
+        if total_ip and total_ip > 0:
+            setattr(row, f"{prefix}_mlb_starter_era_l3", (er * 9) / total_ip)
+            setattr(row, f"{prefix}_mlb_starter_whip_l3", (hits + walks) / total_ip)
+            setattr(row, f"{prefix}_mlb_starter_avg_ip_l3", total_ip / len(logs) if logs else None)
+        if logs:
+            setattr(row, f"{prefix}_mlb_starter_k_bb_l3", float(strikeouts - walks))
+
+    set_starter_side("home", event.home_team_id)
+    set_starter_side("away", event.away_team_id)
+
+
 def _fill_outcomes(session: Session, row: FeatureRow, event: Event | None) -> None:
-    """Populate outcome labels from event_results (§9)."""
+    """Populate outcome labels from event_results."""
     if not event or not event.result:
         return
 
@@ -504,26 +676,30 @@ def _fill_outcomes(session: Session, row: FeatureRow, event: Event | None) -> No
     row.home_win = int(h > a)
     row.away_win = int(a > h)
 
-    # Spread cover using CLOSING spread
-    if row.line_CLOSE is not None and row.side in ("home", "away"):
-        if row.side == "home":
-            margin = h + row.line_CLOSE - a
-        else:
-            margin = a - row.line_CLOSE - h
-        row.spread_cover = int(margin > 0) if margin != 0 else None
+    for anchor in ("OPEN", "T60", "T30", "CLOSE"):
+        line = getattr(row, f"line_{anchor}", None)
+        if line is None:
+            continue
 
-    # Spread cover using ENTRY (OPEN) spread — §9: "entry spread variant"
-    if row.line_OPEN is not None and row.side in ("home", "away"):
-        if row.side == "home":
-            margin_entry = h + row.line_OPEN - a
-        else:
-            margin_entry = a - row.line_OPEN - h
-        row.spread_cover_entry = int(margin_entry > 0) if margin_entry != 0 else None
+        if row.side in ("home", "away"):
+            if row.side == "home":
+                margin = h + line - a
+            else:
+                margin = a + line - h
+            setattr(row, f"spread_cover_{anchor}", int(margin > 0) if margin != 0 else None)
 
-    # Total over/under
-    if row.line_CLOSE is not None and row.side in ("over", "under"):
-        total_score = h + a
-        if row.side == "over":
-            row.total_over = int(total_score > row.line_CLOSE)
-        else:
-            row.total_over = int(total_score < row.line_CLOSE)
+        if row.side in ("over", "under"):
+            total_score = h + a
+            if total_score == line:
+                outcome = None
+            elif row.side == "over":
+                outcome = int(total_score > line)
+            else:
+                outcome = int(total_score < line)
+            setattr(row, f"total_over_{anchor}", outcome)
+
+    # Backward-compatible aliases. Backtests use anchor-specific labels so
+    # moved spread/total lines settle at the actual entry line.
+    row.spread_cover = row.spread_cover_CLOSE
+    row.spread_cover_entry = row.spread_cover_OPEN
+    row.total_over = row.total_over_CLOSE
