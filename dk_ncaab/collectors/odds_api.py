@@ -12,26 +12,29 @@ Responsibilities:
 
 from __future__ import annotations
 
-import json
-import time
 import random
 import logging
 import re
+import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from pathlib import Path
+from datetime import datetime, timedelta, timezone
 
 import httpx
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from dk_ncaab.config.settings import get_settings
 from dk_ncaab.config.sports import league_for_sport, odds_api_sport_for, validate_odds_sports
 from dk_ncaab.db.session import SessionLocal
 from dk_ncaab.db.models import (
-    League, Event, OddsQuote, OddsRawPayload, OddsApiUsage,
+    Event,
+    EventProviderKey,
+    League,
+    OddsApiUsage,
+    OddsQuote,
+    OddsRawPayload,
 )
 from dk_ncaab.etl.normalize import (
     american_to_implied,
@@ -334,9 +337,85 @@ def _ensure_league(session: Session, sport: str) -> League:
     return league
 
 
+def _find_event_by_odds_key(session: Session, odds_event_key: str) -> Event | None:
+    event = session.query(Event).filter_by(external_event_key=odds_event_key).first()
+    if event is not None:
+        return event
+
+    provider_key = (
+        session.query(EventProviderKey)
+        .filter_by(provider="odds_api", provider_event_key=odds_event_key)
+        .first()
+    )
+    if provider_key is None:
+        return None
+    return session.query(Event).filter_by(id=provider_key.event_id).first()
+
+
+def _ensure_odds_provider_key(
+    session: Session,
+    *,
+    event: Event,
+    sport: str,
+    odds_event_key: str,
+) -> None:
+    existing = (
+        session.query(EventProviderKey)
+        .filter_by(provider="odds_api", provider_event_key=odds_event_key)
+        .first()
+    )
+    if existing is not None:
+        return
+
+    session.add(
+        EventProviderKey(
+            event_id=event.id,
+            sport_key=sport,
+            provider="odds_api",
+            provider_event_key=odds_event_key,
+        )
+    )
+    session.flush()
+
+
+def _match_existing_event(
+    session: Session,
+    *,
+    home_team_id: int,
+    away_team_id: int,
+    start_utc: datetime,
+) -> Event | None:
+    window_start = start_utc - timedelta(hours=6)
+    window_end = start_utc + timedelta(hours=6)
+    candidates = list(
+        session.query(Event)
+        .filter(
+            Event.home_team_id == home_team_id,
+            Event.away_team_id == away_team_id,
+            Event.start_time_utc >= window_start,
+            Event.start_time_utc <= window_end,
+        )
+    )
+    if not candidates:
+        return None
+
+    def sort_key(event: Event) -> tuple[int, int, float, int]:
+        provider_keys = (
+            session.query(EventProviderKey)
+            .filter(EventProviderKey.event_id == event.id)
+            .count()
+        )
+        has_result = 1 if event.result is not None else 0
+        distance_sec = abs(((_ensure_aware(event.start_time_utc) or start_utc) - start_utc).total_seconds())
+        return (-provider_keys, -has_result, distance_sec, event.id)
+
+    return sorted(candidates, key=sort_key)[0]
+
+
 def _upsert_event(
     session: Session,
     league: League,
+    sport: str,
     api_event: dict,
 ) -> Event:
     """Create or update an event from the API response.
@@ -347,7 +426,7 @@ def _upsert_event(
       3. Create new
     """
     ext_key = api_event["id"]
-    event = session.query(Event).filter_by(external_event_key=ext_key).first()
+    event = _find_event_by_odds_key(session, ext_key)
 
     home_name = api_event.get("home_team", "")
     away_name = api_event.get("away_team", "")
@@ -360,28 +439,22 @@ def _upsert_event(
     if event:
         # Update tip time if it changed (postponement)
         event.start_time_utc = start_utc
+        _ensure_odds_provider_key(session, event=event, sport=sport, odds_event_key=ext_key)
         return event
 
     # ── Try to match an existing ESPN event by teams + date ──
-    from datetime import timedelta
-
-    window_start = start_utc - timedelta(hours=6)
-    window_end = start_utc + timedelta(hours=6)
-    existing = (
-        session.query(Event)
-        .filter(
-            Event.home_team_id == home_team.id,
-            Event.away_team_id == away_team.id,
-            Event.start_time_utc >= window_start,
-            Event.start_time_utc <= window_end,
-        )
-        .first()
+    existing = _match_existing_event(
+        session,
+        home_team_id=home_team.id,
+        away_team_id=away_team.id,
+        start_utc=start_utc,
     )
     if existing:
         log.info(
             "Matched odds event to existing %s (id=%d): %s vs %s",
             existing.external_event_key, existing.id, home_name, away_name,
         )
+        _ensure_odds_provider_key(session, event=existing, sport=sport, odds_event_key=ext_key)
         return existing
 
     now = datetime.now(timezone.utc)
@@ -395,6 +468,7 @@ def _upsert_event(
     )
     session.add(event)
     session.flush()
+    _ensure_odds_provider_key(session, event=event, sport=sport, odds_event_key=ext_key)
     log.info("New event: %s vs %s @ %s", home_name, away_name, start_utc)
 
     return event
@@ -555,7 +629,7 @@ def collect_odds() -> int:
 
                 inserted_for_sport = 0
                 for api_event in data:
-                    event = _upsert_event(session, league, api_event)
+                    event = _upsert_event(session, league, sport, api_event)
                     rows = _parse_outcomes(api_event, event, collected_at)
                     inserted_for_sport += _insert_quotes(session, rows)
 

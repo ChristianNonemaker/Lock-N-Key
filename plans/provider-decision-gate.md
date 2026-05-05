@@ -1,54 +1,52 @@
 # Provider Decision Gate
 
-Last reviewed: 2026-04-20
+Last reviewed: 2026-05-05
 
 ## Decision
 
-Do not add database schema for players, injuries, player game logs, props, or
-saved recommendations until provider choices and identifier contracts are known.
+Only add provider-backed schema after the provider, identity, cadence, quota, and
+retention contracts are known.
 
-## Why
+MLB now has approved schema for team/player logs, probable starters, identities,
+Statcast daily features, venues/environment, park factors, and event-specific markets.
+Those contracts are implemented and should remain append-only.
 
-These tables will become long-lived lineage surfaces. Adding placeholders now
-would force later migrations around unknown provider IDs, team/player identity,
-prop market semantics, injury status vocabularies, void/push behavior, and
-refresh cadence.
+Other sports remain gated for richer providers:
 
-## Required Provider Matrix Before Schema
+- NCAAB: KenPom/AP/manual strength inputs exist; player, injury, and prop providers
+  are not chosen.
+- NCAAF/NFL: schedule/results and generic odds snapshots only.
+- NBA/Soccer: planned placeholders, disabled for deployment.
 
-For each sport, choose and document:
+## Required Matrix Before New Schema
 
-- schedule source
-- odds source and provider sport key
-- results source
-- public splits source
-- team stats source
-- player stats source
-- injury source
-- props source
-- feature enrichers
-- UI eligibility
-- monthly/daily quota or scrape risk
-- stable external IDs for teams, players, events, markets, and books
-- allowed retention and raw-payload policy
+For each new sport/provider surface, document:
 
-The registry fields in `dk_ncaab/config/sports.py` are the current source of
-truth. Unknown provider areas should remain `None` or disabled.
+- schedule source,
+- odds source and provider sport key,
+- results source,
+- public splits source,
+- team stats source,
+- player stats source,
+- injury/source availability,
+- props source and settlement semantics,
+- durable IDs for teams, players, events, markets, and books,
+- quota/scrape risk,
+- raw-payload retention policy,
+- UI eligibility.
 
-## Schema Acceptance Criteria
+## Acceptance Criteria
 
-Add schema only when the chosen provider can answer:
+New schema is allowed only when it can answer:
 
-- What is the durable player ID?
-- How does the player map to team, sport, season, and provider?
-- Are injury statuses normalized or provider-specific?
-- Are props event-level, player-level, team-level, or market-level?
-- How are pushes, voids, postponements, and stat corrections represented?
-- What raw payload should be retained for audit?
-- What is the quota/cadence budget?
+- What is the durable external ID?
+- How does it map to local teams/events/players?
+- Is the data available before the betting anchor?
+- How are pushes, voids, postponements, and corrections represented?
+- What raw payload is preserved?
+- What bounded command or cadence collects it?
 
 ## Current Action
 
-Schema work is intentionally deferred. The next productive path is entry-time EV
-modeling on the existing event/team/odds/result tables, while provider research
-for player/injury/prop data happens separately.
+Finish MLB as the reference sport, then use the same contracts for NCAAB/NFL/NCAAF
+expansion. Do not enable NBA or Soccer until provider tests and quota policy exist.

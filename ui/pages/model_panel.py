@@ -93,8 +93,6 @@ def render(api_base: str) -> None:
 
     for sig in signals:
         direction = "🔴 FADE" if sig["residual"] > 0 else "🟢 BET"
-        ev_color = "inverse" if sig["model_expected_value"] > 0 else "off"
-
         with st.container(border=True):
             cols = st.columns([1, 2, 1, 1, 1])
             cols[0].markdown(f"### {direction}")

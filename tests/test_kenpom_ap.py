@@ -3,17 +3,16 @@ Tests for KenPom deviation, AP rankings, interaction features,
 outcome model, and backtest enhancements.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from dk_ncaab.db.models import (
-    Base, League, Team, Event, OddsQuote, EventResult,
+    Base, League, Team,
     KenPomRating, APRanking,
 )
-from dk_ncaab.etl.normalize import american_to_implied
 from dk_ncaab.collectors.kenpom import expected_spread, spread_deviation
 from dk_ncaab.collectors.ap_rankings import compute_event_ap_features, UNRANKED_SENTINEL
 

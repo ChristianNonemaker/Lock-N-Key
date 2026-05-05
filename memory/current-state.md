@@ -1,50 +1,54 @@
 # Current State
 
-Last reviewed: 2026-04-22
+Last reviewed: 2026-05-05
 
-## Simple Version
+## Summary
 
-This repo is a working early sports betting research platform. It already collects game schedules/results, betting lines, public split data, and some strength/ranking inputs. It stores the data, builds features, runs exploratory models/backtests, exposes a read-only FastAPI API, and shows a Streamlit dashboard.
+This repo is a working private sportsbook research workstation. It collects schedules,
+results, DraftKings odds, selected public/sport context, builds feature rows, runs strict
+entry-EV artifacts, exposes read-only FastAPI endpoints, and renders a Streamlit
+Sportsbook Board.
 
-The project is not production-finished yet. The main remaining work is making the data pipeline reliable on a tiny private VM, tightening free-tier odds API usage, making model evaluation honest enough for real EV decisions, and polishing the dashboard so it is easy to use on desktop and mobile.
+Local is ahead of the VM. The VM was unreachable in the latest Tailscale check, so the
+near-term path is local stabilization first, then VM promotion after backup and health
+checks.
 
-## What Exists
+## Deployment Scope
 
-- ESPN loaders for schedules/results.
-- The Odds API collector for DraftKings lines.
-- Action Network public betting split scraper through Playwright.
-- Manual CSV-style KenPom/AP import paths.
-- SQLAlchemy schema for leagues, teams, events, odds, splits, raw payloads, results, KenPom, and AP rankings.
-- Query-time OPEN/T60/T30/CLOSE snapshot logic.
-- Feature generation, parquet exports, close/outcome models, and exploratory backtests.
-- FastAPI read-only endpoints and Streamlit pages for games, teams, detail, model panel, backtest, and pipeline status.
-- A sportsbook-style board now exists with `GET /board`, `GET /events/{event_id}/research`, batched `GET /events/research`, URL state, expandable game rows, and a persisted private Research Slip.
-- A sport/provider registry now drives collector/API/UI sport eligibility from `dk_ncaab/config/sports.py`.
-- ESPN schedule/result processing now has no-network tests for NCAAB, NCAAF, NFL, and MLB event creation, final updates, and malformed payload handling.
-- Entry-time EV foundations now exist: American-price settlement, anchor-specific spread/total settlement, push-aware outcomes, event-grouped CV, OOF Ridge prediction helper, sport/anchor-aware feature selection, threshold calibration, and OOF artifact helpers.
-- Strict entry-EV artifact generation now exists through `python -m dk_ncaab oof-entry-ev`; it requires `price_american_<anchor>` and refuses stale parquet that cannot support true EV math.
-- VM/Tailscale/cron/backup planning and scripts.
-- The current VM deployment is reachable through Tailscale Serve at `https://odds-vm.tail1282c7.ts.net`.
-- Local development is now the preferred proving ground for odds/model/UI iteration before promoting to the VM.
+- Deployment sports: NCAAB, NCAAF, NFL, MLB.
+- MLB is the reference sport for deep research and evidence.
+- NBA and Soccer/EPL are planned placeholders and disabled for UI/schedule/odds.
+- Production profile: SQLite + cron + systemd + Tailscale Serve.
+- Docker/Postgres/APScheduler are legacy/dev alternatives.
 
-## Not Finished
+## What Works
 
-- Production foundation is now documented as SQLite + cron + systemd + Tailscale. Docker/Postgres/APScheduler paths remain legacy/dev alternatives.
-- Odds API usage is now tracked in append-only `odds_api_usage` rows by sport, with cadence/max-sports/reserve gates before HTTP calls.
-- VM cron now skips odds/splits by default to protect free quota and VM load until explicit env flags enable them.
-- Multi-sport support exists through the registry for NCAAB, NCAAF, NFL, and MLB. NCAAB is still the only deeply enriched sport.
-- NBA and soccer are planned registry placeholders, not active collection or UI sports.
-- The deployed board is empty right now because the VM has 0 upcoming events and 0 odds quotes. Cron now succeeds by skipping odds/splits until those data sources are explicitly enabled.
-- The local DB now has a first quota-gated MLB odds smoke: 24 upcoming MLB events, 136 DraftKings odds quotes, and 1 recorded Odds API request for `baseball_mlb` as of 2026-04-22. It still has 0 results, so strict EV artifacts cannot be trained from this local MLB sample yet.
-- Backtest/model metrics are still exploratory unless they come from the new out-of-fold/walk-forward helpers and settlement reports. Existing local parquet is stale for strict EV because it lacks American entry price columns.
-- UI is functional and now has board deep links/watchlist persistence, but still needs more real populated data and repeated screenshot review.
-- Private access depends on perimeter controls; there is no app-level auth.
+- ESPN schedule/results loaders.
+- The Odds API DraftKings core lines with append-only usage accounting.
+- MLB event-specific odds for team totals, pitcher strikeouts, batter hits, and batter
+  total bases.
+- MLB Stats API team/player logs, probable starters, identities, Statcast daily imports,
+  venue/environment, and reviewed park-factor import paths.
+- Strict pregame OPEN/T60/T30/CLOSE snapshot policy.
+- Strict `oof-entry-ev` artifact generation with event-grouped OOF predictions and
+  American-price settlement math.
+- Sportsbook Board with line-first rows, focused line views, slate intelligence, market
+  readiness, evidence growth, and a private Research Slip / Ledger.
 
-## Where You Left Off
+## Current Local Data
 
-The codebase is past scaffolding. The next best moves are:
+- MLB inventory: 358 events, 346 finals, 12 upcoming.
+- DraftKings core quotes: 634.
+- Event-specific quotes: 516 after one bounded post-stabilization pull.
+- Settled DK pregame events: 74.
+- Latest strict MLB T60 artifact: 652 OOF predictions, 242 flagged rows, about -1.8% ROI,
+  `promotion_status=sample_sensitive`.
+- Evidence is useful plumbing but not a betting feed; promotion gates should remain visible.
 
-1. Choose providers before schema work for player stats, injuries, props, or saved recommendations.
-2. Let the local MLB odds sample settle through ESPN results, then rebuild fresh parquet with American price columns and run `python -m dk_ncaab oof-entry-ev` before showing model-driven edge in the UI.
-3. Tighten statistical validation around calibrated outcome probabilities and sport/market/anchor thresholds.
-4. Continue improving the Sportsbook Board with real player-stat providers and populated screenshot review from fixture or real private data.
+## Immediate Priorities
+
+1. Keep tests and docs consistent with four-sport deployment scope.
+2. Keep API docs disabled by default.
+3. Grow thin MLB markets, especially `pitcher_strikeouts` and `team_totals`.
+4. Resolve remaining unlinked event-specific player quotes.
+5. Bring `odds-vm` online, back it up, then promote through Git after local validation.

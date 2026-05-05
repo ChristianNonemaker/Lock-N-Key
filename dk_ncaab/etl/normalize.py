@@ -13,7 +13,7 @@ import re
 import unicodedata
 from datetime import datetime, timedelta
 
-from sqlalchemy import select, func
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from dk_ncaab.db.models import Team, TeamAlias, Event

@@ -27,12 +27,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.calibration import CalibratedClassifierCV
 
 from dk_ncaab.analysis.settlement import expected_value_units
-from dk_ncaab.analysis.models_close_predict import (
-    temporal_cv_splits,
-    FoldResult,
-    ModelResult,
-    TARGET,
-)
+from dk_ncaab.analysis.models_close_predict import temporal_cv_splits
 
 log = logging.getLogger(__name__)
 

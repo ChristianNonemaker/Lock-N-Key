@@ -1,37 +1,36 @@
 # Known Risks
 
-Last reviewed: 2026-04-22
+Last reviewed: 2026-05-05
 
 ## Highest Priority
 
-1. Multiple orchestration paths can collide. Production is cron/systemd/Tailscale; do not start legacy Docker/APScheduler/Windows schedulers alongside it.
-2. Private hosting is perimeter-only. CORS is now restricted by config, but there is still no app-level auth.
-3. Model/backtest evaluation is exploratory unless it uses event-grouped walk-forward/out-of-fold predictions plus settlement-aware ROI.
-4. SQLite is the production default, while Postgres compose remains as local/legacy. Keep code migration-friendly and avoid reintroducing storage split-brain.
-5. NBA and soccer exist only as disabled registry placeholders; do not enable them without provider mapping tests and quota-reviewed cadence.
+1. VM is currently unreachable; deployment is blocked until Tailscale/VM health is restored.
+2. Multiple orchestration paths can collide. Production is cron/systemd/Tailscale only.
+3. Private hosting is perimeter-only; no app-level auth exists.
+4. Strict OOF evidence is still sample-sensitive and currently negative ROI in the latest
+   MLB artifact.
+5. NBA and Soccer/EPL must stay disabled placeholders until provider contracts land.
 
 ## Data Correctness
 
-- Snapshot exact-tip boundary uses `<=` in places. Treat exact tip as ambiguous/leaky until tests clarify desired behavior.
-- `splits_quotes` does not appear to have an odds-style dedup constraint, so repeated scrapes may duplicate rows.
-- Event matching has had duplicate-event issues before. Treat team/time matching as a known weak point.
-- DST-naive Eastern time conversion exists in scheduler logic that assumes UTC-5.
+- Preserve append-only odds, event odds, splits, raw payloads, and results.
+- Exact-tip rows are not entry-safe.
+- Event identity drift remains possible on environments that have not run reconciliation.
+- Splits scraping is brittle and should remain off cron.
+- Historical baseball stats are not historical betting lines.
 
-## Product Gaps
+## Product Risks
 
-- No saved signal history of model-recommended entries. The Research Slip now persists a private watchlist, but it is not a recommendation ledger.
-- No alerting for new edges or sharp movement.
-- No app-level auth or role separation.
-- Mobile board flow has URL state and a screenshot harness, but still needs repeated populated-device review.
-- No fully free betting-lines feed is documented in this repo. ESPN is free for scores/schedules; The Odds API is quota-limited for lines.
-- Sport/provider capability now has a registry, but it does not solve provider availability for player stats, injuries, props, or soccer league coverage.
-- Player, injury, prop, and saved-recommendation schema is intentionally gated by `plans/provider-decision-gate.md`.
+- Dashboard overclaiming is the easiest way to fool ourselves.
+- Thin prop/team-total samples should remain labeled research-only or sample-sensitive.
+- No saved recommendation/decision ledger existed historically; the new ledger is local
+  and private, not wager placement.
+- Mobile board flow needs screenshot review after each substantial change.
 
-## When To Stop And Ask
+## Stop And Ask
 
-- Before changing storage backend or backup policy.
-- Before enabling public ingress or changing network exposure.
+- Before changing storage/backup policy.
+- Before public ingress or app-level auth changes.
 - Before increasing odds polling frequency.
-- Before presenting historical model metrics as production-grade edge evidence.
-- Before broad multi-sport assumptions that bypass team identity, market semantics, or source availability.
-- Before adding sport-specific providers outside `dk_ncaab/config/sports.py`.
+- Before buying historical odds.
+- Before enabling NBA/Soccer or new provider-backed schemas.

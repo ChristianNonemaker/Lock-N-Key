@@ -8,8 +8,10 @@ Env vars use prefix DKNCAAB_ and double-underscore nesting:
 
 from __future__ import annotations
 
-from pathlib import Path
+import os
+from copy import deepcopy
 from functools import lru_cache
+from pathlib import Path
 
 import yaml
 from pydantic import BaseModel, Field
@@ -82,6 +84,15 @@ class MlbStatsCfg(BaseModel):
     request_delay_sec: float = 0.1
 
 
+class MlbEnvironmentCfg(BaseModel):
+    provider: str = "nws_api"
+    nws_base_url: str = "https://api.weather.gov"
+    user_agent: str = "dk-prediction-private-research (local)"
+    max_events_per_run: int = 12
+    request_delay_sec: float = 1.0
+    forecast_lookahead_hours: int = 96
+
+
 class SplitsCfg(BaseModel):
     url: str = "https://www.actionnetwork.com/ncaab/public-betting"
     headless: bool = True
@@ -91,6 +102,7 @@ class SplitsCfg(BaseModel):
 
 
 class ApiCfg(BaseModel):
+    enable_docs: bool = False
     allowed_origins: list[str] = Field(
         default_factory=lambda: [
             "http://localhost:8501",
@@ -117,6 +129,7 @@ class Settings(BaseSettings):
     polling: PollingCfg = PollingCfg()
     schedule: ScheduleCfg = ScheduleCfg()
     mlb_stats: MlbStatsCfg = MlbStatsCfg()
+    mlb_environment: MlbEnvironmentCfg = MlbEnvironmentCfg()
     splits: SplitsCfg = SplitsCfg()
     api: ApiCfg = ApiCfg()
     storage: StorageCfg = StorageCfg()
@@ -138,7 +151,38 @@ def _load_yaml() -> dict:
     return {}
 
 
+def _parse_env_value(value: str) -> object:
+    """Parse env values through YAML so booleans, numbers, and lists keep type."""
+    if value == "":
+        return ""
+    try:
+        return yaml.safe_load(value)
+    except yaml.YAMLError:
+        return value
+
+
+def _apply_env_overrides(data: dict) -> dict:
+    """Apply DKNCAAB__ style env overrides after YAML loading."""
+    merged = deepcopy(data)
+    prefix = "DKNCAAB_"
+    for raw_key, raw_value in os.environ.items():
+        if not raw_key.startswith(prefix):
+            continue
+        path = [part.lower() for part in raw_key[len(prefix) :].split("__") if part]
+        if not path:
+            continue
+        target = merged
+        for part in path[:-1]:
+            child = target.get(part)
+            if not isinstance(child, dict):
+                child = {}
+                target[part] = child
+            target = child
+        target[path[-1]] = _parse_env_value(raw_value)
+    return merged
+
+
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     """Singleton settings: YAML values overridden by env vars."""
-    return Settings(**_load_yaml())
+    return Settings(**_apply_env_overrides(_load_yaml()))

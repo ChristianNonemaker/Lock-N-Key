@@ -1,38 +1,30 @@
 # Agent Memory Index
 
-Last reviewed: 2026-04-22
+Last reviewed: 2026-05-05
 
-This folder holds compact repo memory for future agents. Read the relevant file before broad searches so the main context stays clean.
+Read `current-state.md` first, then only the focused file needed for the task.
 
 ## Files
 
-- `current-state.md`: simple summary of where the project is right now.
-- `repo-map.md`: subsystem map, commands, and source-of-truth docs.
-- `data-pipeline-and-ops.md`: collectors, free data sources, quotas, VM/private-hosting shape.
-- `modeling-and-backtests.md`: datasets, modeling, EV/CLV/ROI, leakage risks.
-- `ui-and-api.md`: FastAPI and Streamlit inventory, UX gaps, screenshot workflow.
-- `known-risks.md`: short list of the most important risks and next decisions.
-- `deep-dive-2026-04-20.md`: current senior-level audit across collectors,
-  schema, API/UI, modeling, ops, validation, and multi-sport readiness.
-- `sport-provider-registry.md`: sport/provider source of truth, defaults,
-  eligibility rules, and registry validation notes.
-- `odds-quota-accounting.md`: append-only Odds API usage accounting,
-  cadence/budget gates, and `/status` budget fields.
-- `espn-schedule-results.md`: no-network ESPN schedule/result contract tests
-  for active sports and remaining fixture gaps.
-- `entry-ev-modeling.md`: settlement-aware backtesting, entry-safe features,
-  threshold calibration, and event-grouped OOF validation foundations.
+- `current-state.md`: where the project stands now.
+- `repo-map.md`: source-of-truth docs, layout, and commands.
+- `data-pipeline-and-ops.md`: ingestion, quotas, VM/runtime, storage.
+- `modeling-and-backtests.md`: feature/evidence contract and strict EV.
+- `ui-and-api.md`: API and Streamlit board inventory.
+- `known-risks.md`: current risks and ask-before-changing boundaries.
+- `deployment-readiness-2026-05-05.md`: stabilization findings and VM promotion gate.
+- `sport-provider-registry.md`: sport/provider source of truth.
+- `odds-quota-accounting.md`: Odds API request accounting.
+- `espn-schedule-results.md`: ESPN schedule/result tests.
+- `entry-ev-modeling.md`: strict entry-EV foundations.
+- `mlb-historical-data-sources.md`: MLB source/backfill map.
 
-## How To Use
+Older deep dives are historical snapshots. Verify their facts against current memory and
+code before relying on them.
 
-1. Read `current-state.md` first for orientation.
-2. Read only the focused file for the current task.
-3. Verify stale facts with targeted `rg` or file reads before editing.
-4. Add new durable findings here instead of forcing future agents to rediscover them.
+## Memory Format
 
-## Memory Update Format
-
-Use this shape for new memory files:
+Keep files under about 120 lines:
 
 ```markdown
 # Topic
@@ -40,12 +32,7 @@ Use this shape for new memory files:
 Last reviewed: YYYY-MM-DD
 
 ## Summary
-
 ## Important Files
-
-## Known Risks
-
+## Risks
 ## Verification
 ```
-
-Keep memory concise. Do not paste long logs, full command output, or raw payloads.

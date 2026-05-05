@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-import numpy as np
 import pandas as pd
 
 from dk_ncaab.analysis.backtest import (
@@ -32,6 +31,9 @@ IDENTITY_COLUMNS = {
     "league_key",
     "market",
     "side",
+    "participant_entity_type",
+    "participant_team_id",
+    "participant_player_id",
 }
 
 OUTCOME_COLUMNS = {

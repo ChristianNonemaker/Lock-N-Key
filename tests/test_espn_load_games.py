@@ -13,7 +13,7 @@ from dk_ncaab.collectors.load_games import (
     _process_espn_event,
     _sport_from_event,
 )
-from dk_ncaab.db.models import Base, Event, EventResult, League, Team
+from dk_ncaab.db.models import Base, Event, EventProviderKey, EventResult, League, Team
 from dk_ncaab.db.models import TeamAlias
 from dk_ncaab.etl.normalize import normalize_team_name
 
@@ -192,8 +192,9 @@ def test_load_games_for_date_fans_out_active_sports_no_network(monkeypatch, sess
         datetime(2026, 4, 20, 12, 0, tzinfo=timezone.utc)
     )
 
+    # Deployment scope is four sports. NBA and Soccer stay planned/disabled.
     assert created == 4
-    assert calls == [( "20260420", sport) for sport, *_ in ACTIVE_SPORTS]
+    assert calls == [("20260420", sport) for sport, *_ in ACTIVE_SPORTS]
     with session_factory() as sess:
         assert sess.query(Event).count() == 4
         assert sess.query(League).count() == 4
@@ -404,3 +405,119 @@ def test_update_scores_revisits_final_events_missing_results(monkeypatch, sessio
     assert calls == [("20260420", "baseball_mlb")]
     with session_factory() as sess:
         assert sess.query(EventResult).count() == 1
+
+
+def test_espn_matches_existing_odds_event_by_teams_time_and_reuses_it(session):
+    league = _ensure_league(session, "baseball_mlb")
+    home = Team(league_id=league.id, name="Washington Nationals", normalized_name="washington nationals")
+    away = Team(league_id=league.id, name="Atlanta Braves", normalized_name="atlanta braves")
+    session.add_all([home, away])
+    session.flush()
+
+    existing = Event(
+        league_id=league.id,
+        external_event_key="odds-api-event",
+        start_time_utc=datetime(2026, 4, 20, 23, 30, tzinfo=timezone.utc),
+        home_team_id=home.id,
+        away_team_id=away.id,
+        status="upcoming",
+    )
+    session.add(existing)
+    session.flush()
+
+    created, score_added, status_updated = _process_espn_event(
+        session,
+        _espn_event(
+            event_id="9001",
+            state="pre",
+            home="Washington Nationals",
+            away="Atlanta Braves",
+        ),
+        league,
+        "baseball_mlb",
+    )
+    session.commit()
+
+    assert (created, score_added, status_updated) == (0, 0, 0)
+    assert session.query(Event).count() == 1
+    assert session.query(EventProviderKey).filter_by(
+        provider="espn",
+        provider_event_key="espn:baseball_mlb:9001",
+    ).one().event_id == existing.id
+
+    created, score_added, status_updated = _process_espn_event(
+        session,
+        _espn_event(
+            event_id="9001",
+            state="post",
+            home="Washington Nationals",
+            away="Atlanta Braves",
+            home_score=5,
+            away_score=3,
+        ),
+        league,
+        "baseball_mlb",
+    )
+    session.commit()
+
+    assert (created, score_added, status_updated) == (0, 1, 1)
+    event = session.query(Event).filter_by(id=existing.id).one()
+    assert event.status == "final"
+    result = session.query(EventResult).filter_by(event_id=existing.id).one()
+    assert result.home_score == 5
+    assert result.away_score == 3
+
+
+def test_espn_prefers_existing_event_with_provider_lineage_when_duplicates_exist(session):
+    league = _ensure_league(session, "baseball_mlb")
+    home = Team(league_id=league.id, name="Seattle Mariners", normalized_name="seattle mariners")
+    away = Team(league_id=league.id, name="Texas Rangers", normalized_name="texas rangers")
+    session.add_all([home, away])
+    session.flush()
+
+    weaker = Event(
+        league_id=league.id,
+        external_event_key="temp-weak",
+        start_time_utc=datetime(2026, 4, 20, 23, 35, tzinfo=timezone.utc),
+        home_team_id=home.id,
+        away_team_id=away.id,
+        status="upcoming",
+    )
+    stronger = Event(
+        league_id=league.id,
+        external_event_key="temp-strong",
+        start_time_utc=datetime(2026, 4, 20, 23, 30, tzinfo=timezone.utc),
+        home_team_id=home.id,
+        away_team_id=away.id,
+        status="upcoming",
+    )
+    session.add_all([weaker, stronger])
+    session.flush()
+    session.add(
+        EventProviderKey(
+            event_id=stronger.id,
+            sport_key="baseball_mlb",
+            provider="odds_api",
+            provider_event_key="odds-provider-key",
+        )
+    )
+    session.commit()
+
+    created, score_added, status_updated = _process_espn_event(
+        session,
+        _espn_event(
+            event_id="9002",
+            state="pre",
+            home="Seattle Mariners",
+            away="Texas Rangers",
+        ),
+        league,
+        "baseball_mlb",
+    )
+    session.commit()
+
+    assert (created, score_added, status_updated) == (0, 0, 0)
+    assert session.query(EventProviderKey).filter_by(
+        provider="espn",
+        provider_event_key="espn:baseball_mlb:9002",
+    ).one().event_id == stronger.id

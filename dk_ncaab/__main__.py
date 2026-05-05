@@ -3,21 +3,36 @@ CLI entrypoint - run with: python -m dk_ncaab <command>
 
 Commands:
   collect-odds      Run one quota-gated odds collection cycle
+  collect-event-odds Collect bounded event-specific markets such as team totals and props
   collect-mlb-stats Collect MLB Stats API team/player logs (no odds quota)
+  backfill-mlb-current-season Backfill MLB Stats API logs in bounded windows
+  mlb-data-inventory Report local MLB data ranges, counts, and join gaps
+  mlb-evidence-growth-log Append local MLB evidence growth/readiness snapshot
+  import-mlb-player-ids Import Chadwick-style MLB player ID crosswalk CSV
+  import-mlb-statcast-daily Import Baseball Savant/Statcast CSV daily features
+  backfill-mlb-statcast-daily Download/import bounded Baseball Savant daily features
+  collect-mlb-environment Collect MLB weather/wind context (no odds quota)
   collect-splits    Run one splits scrape cycle
   collect-results   Run one results collection cycle (1 API request)
   load-games        Load games from ESPN for a date (FREE)
   update-results    Update all pending games with scores from ESPN (FREE)
   backfill          Backfill N days of games + scores from ESPN (FREE)
+  reconcile-mlb-events Dry-run or apply one-time MLB duplicate-event cleanup
+  reconcile-event-odds-identities Dry-run or fill missing event-specific odds participant IDs
   pipeline          Full daily pipeline: load->odds->update-results->build
   auto              Smart auto-collector daemon (budget-aware)
   import-kenpom     Import KenPom ratings from CSV (§4)
   import-ap         Import AP rankings from CSV (§5)
+  export-mlb-venue-metadata-template Export fillable MLB venue metadata CSV
+  import-mlb-venue-metadata Import reviewed MLB venue metadata from CSV
+  import-mlb-park-factors Import reviewed MLB park factors from CSV
   build-dataset     Build features and export to Parquet
+  export-mlb-market-history Export settlement-aware MLB event-market history parquet
   train             Train prediction models on collected data
   report            Generate correlation report
   build-oof         Build local out-of-fold close-proxy artifacts
   oof-entry-ev      Build strict OOF entry-EV artifacts
+  mlb-daily-research-cycle Print the bounded MLB dashboard refresh workflow
   backtest          Run backtest suite on historical data (§11)
   predict           Score upcoming games with trained models (§10.3)
   models            List saved trained models
@@ -48,6 +63,18 @@ def main() -> None:
 
     # ── Data collectors ─────────────────────────────────────────
     sub.add_parser("collect-odds", help="Run one quota-gated odds collection cycle")
+    event_odds = sub.add_parser(
+        "collect-event-odds",
+        help="Collect bounded event-specific odds such as team totals and player props",
+    )
+    event_odds.add_argument("--sport", default="baseball_mlb")
+    event_odds.add_argument("--max-events", type=int, default=1)
+    event_odds.add_argument("--lookahead-hours", type=int, default=24)
+    event_odds.add_argument("--stale-after-minutes", type=int, default=180)
+    event_odds.add_argument(
+        "--markets",
+        help="Optional comma-separated provider market keys; defaults to the sport registry subset",
+    )
     mlb = sub.add_parser(
         "collect-mlb-stats",
         help="Collect MLB Stats API team/player logs (no odds quota)",
@@ -62,6 +89,58 @@ def main() -> None:
         action="store_true",
         help="Fetch boxscores for non-final games too",
     )
+    mlb.add_argument(
+        "--refetch-existing-boxscores",
+        action="store_true",
+        help="Fetch boxscores even when local team/player logs already exist",
+    )
+    mlb_backfill = sub.add_parser(
+        "backfill-mlb-current-season",
+        help="Backfill MLB Stats API logs in bounded current-season windows",
+    )
+    mlb_backfill.add_argument("--start-date", help="Start date YYYY-MM-DD, defaults to Apr 1")
+    mlb_backfill.add_argument("--end-date", help="End date YYYY-MM-DD, defaults to today")
+    mlb_backfill.add_argument("--window-days", type=int, default=3)
+    mlb_backfill.add_argument("--max-boxscores-per-window", type=int)
+    mlb_backfill.add_argument("--request-delay-sec", type=float)
+    mlb_backfill.add_argument(
+        "--include-unfinal",
+        action="store_true",
+        help="Fetch boxscores for non-final games too",
+    )
+    mlb_backfill.add_argument(
+        "--refetch-existing-boxscores",
+        action="store_true",
+        help="Fetch boxscores even when local team/player logs already exist",
+    )
+    mlb_backfill.add_argument("--dry-run", action="store_true")
+    inventory = sub.add_parser(
+        "mlb-data-inventory",
+        help="Report local MLB date ranges, counts, line history, and join gaps",
+    )
+    inventory.add_argument(
+        "--out-dir",
+        default="artifacts/inventory",
+        help="Directory for mlb_data_inventory.json; use --no-write to skip",
+    )
+    inventory.add_argument("--no-write", action="store_true")
+    growth = sub.add_parser(
+        "mlb-evidence-growth-log",
+        help="Append local MLB evidence growth and next-action snapshot",
+    )
+    growth.add_argument(
+        "--out-dir",
+        default="artifacts/evidence_growth",
+        help="Directory for MLB evidence growth artifacts",
+    )
+    growth.add_argument("--label", help="Optional operator label for this snapshot")
+    growth.add_argument("--no-write", action="store_true")
+    mlb_env = sub.add_parser(
+        "collect-mlb-environment",
+        help="Collect MLB NWS weather/wind snapshots (no odds quota)",
+    )
+    mlb_env.add_argument("--max-events", type=int, help="Maximum upcoming events to inspect")
+    mlb_env.add_argument("--request-delay-sec", type=float, help="Delay between NWS requests")
     sub.add_parser("collect-splits", help="Run one splits scrape cycle")
     sub.add_parser(
         "collect-results",
@@ -86,6 +165,38 @@ def main() -> None:
     )
     bf.add_argument("--sport", help="Optional sport key, e.g. baseball_mlb")
 
+    reconcile = sub.add_parser(
+        "reconcile-mlb-events",
+        help="Dry-run or apply one-time MLB duplicate-event cleanup",
+    )
+    reconcile.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the reconciliation instead of reporting the plan only",
+    )
+    reconcile.add_argument(
+        "--max-start-diff-minutes",
+        type=int,
+        default=90,
+        help="Maximum start-time gap between duplicate candidates (default 90)",
+    )
+    reconcile.add_argument(
+        "--limit",
+        type=int,
+        help="Optional limit on candidate groups to inspect/apply",
+    )
+    event_identity = sub.add_parser(
+        "reconcile-event-odds-identities",
+        help="Dry-run or fill missing event-specific odds participant IDs",
+    )
+    event_identity.add_argument("--sport", default="baseball_mlb")
+    event_identity.add_argument("--limit", type=int)
+    event_identity.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply source-backed team/player links instead of reporting only",
+    )
+
     # ── Pipeline (combines multiple steps) ──────────────────────
     pp = sub.add_parser(
         "pipeline",
@@ -105,8 +216,74 @@ def main() -> None:
     ap.add_argument("csv_path", help="Path to AP rankings CSV file")
     ap.add_argument("--date", help="Poll date YYYY-MM-DD, defaults to today")
 
+    venue_template = sub.add_parser(
+        "export-mlb-venue-metadata-template",
+        help="Export fillable MLB venue metadata CSV",
+    )
+    venue_template.add_argument("csv_path", help="Path to write venue metadata CSV")
+    venue_import = sub.add_parser(
+        "import-mlb-venue-metadata",
+        help="Import reviewed MLB venue metadata from CSV",
+    )
+    venue_import.add_argument("csv_path", help="Path to venue metadata CSV file")
+    player_ids = sub.add_parser(
+        "import-mlb-player-ids",
+        help="Import Chadwick-style MLB player ID crosswalk CSV",
+    )
+    player_ids.add_argument("csv_path", help="Path to player ID crosswalk CSV")
+    player_ids.add_argument("--source", default="chadwick_register_csv")
+    statcast_daily = sub.add_parser(
+        "import-mlb-statcast-daily",
+        help="Import Baseball Savant/Statcast CSV as daily player features",
+    )
+    statcast_daily.add_argument("csv_path", help="Path to Statcast CSV export")
+    statcast_daily.add_argument("--source", default="baseball_savant_csv")
+    statcast_daily.add_argument("--source-url", help="Optional source URL/reference")
+    statcast_backfill = sub.add_parser(
+        "backfill-mlb-statcast-daily",
+        help="Download/import Baseball Savant Statcast CSVs in bounded windows",
+    )
+    statcast_backfill.add_argument("--start-date", required=True, help="Start date YYYY-MM-DD")
+    statcast_backfill.add_argument("--end-date", required=True, help="End date YYYY-MM-DD")
+    statcast_backfill.add_argument("--window-days", type=int, default=1)
+    statcast_backfill.add_argument(
+        "--out-dir",
+        default="artifacts/raw/mlb/statcast",
+        help="Raw CSV download directory",
+    )
+    statcast_backfill.add_argument("--request-delay-sec", type=float)
+    statcast_backfill.add_argument(
+        "--refetch-existing-downloads",
+        action="store_true",
+        help="Download again even when a raw CSV already exists",
+    )
+    statcast_backfill.add_argument("--dry-run", action="store_true")
+
     # ── Analysis ────────────────────────────────────────────────
+    pf = sub.add_parser("import-mlb-park-factors", help="Import reviewed MLB park factors from CSV")
+    pf.add_argument("csv_path", help="Path to park-factor CSV file")
+    pf.add_argument("--source", default="manual_csv", help="Source label for imported rows")
+    pf.add_argument("--source-url", help="Optional source URL/reference for imported rows")
+
     sub.add_parser("build-dataset", help="Build features -> Parquet")
+    export_mlb_market_history = sub.add_parser(
+        "export-mlb-market-history",
+        help="Export settlement-aware MLB team-total and prop history to parquet",
+    )
+    export_mlb_market_history.add_argument(
+        "--markets",
+        help="Optional comma-separated MLB event-market keys to export",
+    )
+    export_mlb_market_history.add_argument(
+        "--event-limit",
+        type=int,
+        help="Optional limit on most-recent quoted final MLB events to export",
+    )
+    export_mlb_market_history.add_argument(
+        "--out-dir",
+        default="artifacts/market_history/mlb",
+        help="Artifact output directory",
+    )
     sub.add_parser("train", help="Train prediction models on collected data")
     sub.add_parser("report", help="Generate correlation report")
     oof = sub.add_parser("build-oof", help="Build local OOF close-proxy artifacts")
@@ -126,6 +303,21 @@ def main() -> None:
     ev_oof.add_argument("--out-dir", default="artifacts/entry_ev/oof")
     ev_oof.add_argument("--min-train-size", type=int, default=60)
     ev_oof.add_argument("--ev-threshold-units", type=float, default=0.0)
+    mlb_daily = sub.add_parser(
+        "mlb-daily-research-cycle",
+        help="Print a bounded MLB dashboard refresh workflow",
+    )
+    mlb_daily.add_argument("--date", help="Slate date YYYY-MM-DD, defaults to today")
+    mlb_daily.add_argument("--settled-start-date", help="Recent final-game backfill start date")
+    mlb_daily.add_argument("--settled-end-date", help="Recent final-game backfill end date")
+    mlb_daily.add_argument("--statcast-start-date", help="Statcast backfill start date")
+    mlb_daily.add_argument("--statcast-end-date", help="Statcast backfill end date")
+    mlb_daily.add_argument("--event-odds-max-events", type=int, default=1)
+    mlb_daily.add_argument(
+        "--include-event-odds",
+        action="store_true",
+        help="Include the explicit Odds API event-odds step in the printed workflow",
+    )
     sub.add_parser("backtest", help="Run backtest suite on collected data (§11)")
     sub.add_parser("predict", help="Score upcoming games with trained models")
     sub.add_parser("models", help="List saved trained models")
@@ -160,6 +352,21 @@ def main() -> None:
         from dk_ncaab.collectors.odds_api import collect_odds
         collect_odds()
 
+    elif args.command == "collect-event-odds":
+        from dk_ncaab.collectors.odds_event_markets import collect_event_odds_markets
+
+        markets = None
+        if args.markets:
+            markets = [part.strip() for part in args.markets.split(",") if part.strip()]
+        result = collect_event_odds_markets(
+            sport_key=args.sport,
+            max_events=args.max_events,
+            lookahead_hours=args.lookahead_hours,
+            stale_after_minutes=args.stale_after_minutes,
+            markets=markets,
+        )
+        print(result)
+
     elif args.command == "collect-mlb-stats":
         from datetime import datetime as _dt
         from dk_ncaab.collectors.mlb_stats import collect_mlb_stats
@@ -172,6 +379,65 @@ def main() -> None:
             days=args.days,
             final_only=not args.include_unfinal,
             max_boxscores=args.max_boxscores,
+            request_delay_sec=args.request_delay_sec,
+            skip_existing_boxscores=not args.refetch_existing_boxscores,
+        )
+        print(result)
+
+    elif args.command == "backfill-mlb-current-season":
+        from datetime import datetime as _dt
+        from dk_ncaab.collectors.mlb_backfill import backfill_current_mlb_stats
+
+        start = _dt.strptime(args.start_date, "%Y-%m-%d").date() if args.start_date else None
+        end = _dt.strptime(args.end_date, "%Y-%m-%d").date() if args.end_date else None
+        result = backfill_current_mlb_stats(
+            start_date=start,
+            end_date=end,
+            window_days=args.window_days,
+            max_boxscores_per_window=args.max_boxscores_per_window,
+            request_delay_sec=args.request_delay_sec,
+            final_only=not args.include_unfinal,
+            skip_existing_boxscores=not args.refetch_existing_boxscores,
+            dry_run=args.dry_run,
+        )
+        for window in result.windows:
+            print(window)
+        print(f"totals={result.totals}")
+
+    elif args.command == "mlb-data-inventory":
+        from dk_ncaab.analysis.mlb_inventory import build_mlb_data_inventory
+
+        result = build_mlb_data_inventory(out_dir=None if args.no_write else args.out_dir)
+        print(f"MLB data inventory: {result.json_path or 'not written'}")
+        for section, values in result.summary.items():
+            if isinstance(values, dict):
+                print(f"{section}: {values}")
+            else:
+                print(f"{section}: {values}")
+
+    elif args.command == "mlb-evidence-growth-log":
+        from dk_ncaab.analysis.mlb_evidence_growth import build_mlb_evidence_growth_log
+
+        result = build_mlb_evidence_growth_log(
+            out_dir=args.out_dir,
+            label=args.label,
+            write=not args.no_write,
+        )
+        print(f"MLB evidence growth: {result.get('latest_path') or 'not written'}")
+        print(f"generated_at_utc: {result['generated_at_utc']}")
+        print(f"previous_generated_at_utc: {result.get('previous_generated_at_utc') or '-'}")
+        print(f"summary: {result['summary']}")
+        for row in result.get("priority_markets", []):
+            print(
+                f"priority {row['priority_score']}: {row['market']} -> "
+                f"{row['next_action_label']} ({row['next_action_reason']})"
+            )
+
+    elif args.command == "collect-mlb-environment":
+        from dk_ncaab.collectors.mlb_environment import collect_mlb_environment
+
+        result = collect_mlb_environment(
+            max_events=args.max_events,
             request_delay_sec=args.request_delay_sec,
         )
         print(result)
@@ -200,6 +466,37 @@ def main() -> None:
         from dk_ncaab.collectors.load_games import backfill_espn
         backfill_espn(days=args.days, sport=args.sport)
 
+    elif args.command == "reconcile-mlb-events":
+        from dk_ncaab.db.event_reconciliation import reconcile_mlb_event_identity
+
+        result = reconcile_mlb_event_identity(
+            apply=args.apply,
+            max_start_diff_minutes=args.max_start_diff_minutes,
+            limit=args.limit,
+        )
+        print(result)
+
+    elif args.command == "reconcile-event-odds-identities":
+        from dk_ncaab.collectors.event_odds_identity import reconcile_event_odds_identities
+
+        result = reconcile_event_odds_identities(
+            sport_key=args.sport,
+            apply=args.apply,
+            limit=args.limit,
+        )
+        print(
+            "Event odds identity reconciliation: "
+            f"scanned={result.scanned} resolvable={result.resolvable} "
+            f"updated={result.updated} unresolved={result.unresolved}"
+        )
+        for row in result.resolutions:
+            target = row.resolved_player_name or row.resolved_player_id or row.resolved_team_id
+            print(
+                f"quote_id={row.quote_id} event_id={row.event_id} market={row.market_key} "
+                f"participant={row.participant_name!r} -> {target} "
+                f"method={row.method} applied={row.applied}"
+            )
+
     elif args.command == "pipeline":
         _run_pipeline(skip_odds=args.skip_odds)
 
@@ -217,9 +514,88 @@ def main() -> None:
         count = import_ap_csv(args.csv_path, poll_date=date)
         log.info("Imported %d AP rankings", count)
 
+    elif args.command == "export-mlb-venue-metadata-template":
+        from dk_ncaab.collectors.mlb_venue_metadata import (
+            export_mlb_venue_metadata_template_csv,
+        )
+
+        result = export_mlb_venue_metadata_template_csv(args.csv_path)
+        print(result)
+
+    elif args.command == "import-mlb-venue-metadata":
+        from dk_ncaab.collectors.mlb_venue_metadata import import_mlb_venue_metadata_csv
+
+        result = import_mlb_venue_metadata_csv(args.csv_path)
+        print(result)
+
+    elif args.command == "import-mlb-player-ids":
+        from dk_ncaab.collectors.mlb_identity import import_chadwick_player_ids_csv
+
+        result = import_chadwick_player_ids_csv(args.csv_path, source=args.source)
+        print(result)
+
+    elif args.command == "import-mlb-statcast-daily":
+        from dk_ncaab.collectors.mlb_statcast import import_statcast_daily_csv
+
+        result = import_statcast_daily_csv(
+            args.csv_path,
+            source=args.source,
+            source_url=args.source_url,
+        )
+        print(result)
+
+    elif args.command == "backfill-mlb-statcast-daily":
+        from datetime import datetime as _dt
+        from dk_ncaab.collectors.mlb_statcast import backfill_statcast_daily
+
+        result = backfill_statcast_daily(
+            start_date=_dt.strptime(args.start_date, "%Y-%m-%d").date(),
+            end_date=_dt.strptime(args.end_date, "%Y-%m-%d").date(),
+            window_days=args.window_days,
+            out_dir=args.out_dir,
+            request_delay_sec=args.request_delay_sec,
+            skip_existing_downloads=not args.refetch_existing_downloads,
+            dry_run=args.dry_run,
+        )
+        for window in result.windows:
+            print(window)
+        print(f"totals={result.totals}")
+
+    elif args.command == "import-mlb-park-factors":
+        from dk_ncaab.collectors.mlb_park_factors import import_mlb_park_factors_csv
+
+        result = import_mlb_park_factors_csv(
+            args.csv_path,
+            default_source=args.source,
+            default_source_url=args.source_url,
+        )
+        print(result)
+
     elif args.command == "build-dataset":
         from dk_ncaab.analysis.dataset_build import run_dataset_build
         run_dataset_build()
+
+    elif args.command == "export-mlb-market-history":
+        from dk_ncaab.analysis.mlb_market_history import generate_mlb_market_history_artifact
+
+        markets = None
+        if args.markets:
+            markets = [part.strip() for part in args.markets.split(",") if part.strip()]
+        try:
+            result = generate_mlb_market_history_artifact(
+                market_keys=markets,
+                event_limit=args.event_limit,
+                out_dir=args.out_dir,
+            )
+        except ValueError as exc:
+            log.error("MLB market-history artifact was not created: %s", exc)
+            sys.exit(1)
+        print(f"MLB market-history artifact: {result.run_dir}")
+        print(f"  parquet: {result.parquet_path}")
+        print(f"  rows_exported: {result.summary['rows_exported']}")
+        print(f"  events_exported: {result.summary['events_exported']}")
+        for market_key, count in result.summary.get("rows_by_market", {}).items():
+            print(f"  {market_key}: {count}")
 
     elif args.command == "train":
         _run_train()
@@ -274,6 +650,29 @@ def main() -> None:
         print(f"  recommended_count: {result.summary['recommended_count']}")
         for warning in result.summary.get("warnings", []):
             print(f"  warning: {warning}")
+
+    elif args.command == "mlb-daily-research-cycle":
+        from datetime import date as _date
+        from datetime import datetime as _dt
+
+        from dk_ncaab.collectors.mlb_daily_workflow import (
+            build_mlb_daily_research_steps,
+            format_mlb_daily_research_steps,
+        )
+
+        def parse_date(value: str | None) -> _date | None:
+            return _dt.strptime(value, "%Y-%m-%d").date() if value else None
+
+        steps = build_mlb_daily_research_steps(
+            slate_date=parse_date(args.date) or _date.today(),
+            settled_start_date=parse_date(args.settled_start_date),
+            settled_end_date=parse_date(args.settled_end_date),
+            statcast_start_date=parse_date(args.statcast_start_date),
+            statcast_end_date=parse_date(args.statcast_end_date),
+            event_odds_max_events=args.event_odds_max_events,
+            include_event_odds=args.include_event_odds,
+        )
+        print(format_mlb_daily_research_steps(steps))
 
     elif args.command == "backtest":
         _run_backtest()
@@ -698,25 +1097,26 @@ def _show_status() -> None:
     print(f"|  AP rankings:    {ap:>6}                  |")
     print("+------------------------------------------+")
 
-    # Training readiness: settled events with at least one pregame odds quote.
+    # Research readiness: settled events with at least one DraftKings pregame quote.
     with SessionLocal() as session:
         trainable = (
             session.query(Event.id)
             .join(EventResult, EventResult.event_id == Event.id)
             .join(OddsQuote, OddsQuote.event_id == Event.id)
             .filter(Event.status == "final")
-            .filter(OddsQuote.collected_at_utc <= Event.start_time_utc)
+            .filter(OddsQuote.book == "draftkings")
+            .filter(OddsQuote.collected_at_utc < Event.start_time_utc)
             .distinct()
             .count()
         )
     status = "READY" if trainable >= 50 else f"Need {50 - trainable} more"
 
-    print(f"|  Trainable events: {trainable:>4}  {status:>13} |")
+    print(f"|  Settled DK quoted: {trainable:>4}  {status:>12} |")
     print("+------------------------------------------+")
     print()
 
     if trainable < 50:
-        print("Next steps to get training-ready:")
+        print("Next steps to build strict entry-EV evidence:")
         print("  1. python -m dk_ncaab backfill --days 60   (FREE, ~30s)")
         print("  2. python -m dk_ncaab collect-odds          (quota-gated)")
         print("  3. Repeat collect-odds a few times/day for odds history")

@@ -41,6 +41,14 @@ mlb_stats:
   request_delay_sec: 0.1
 
 # ── Splits scraper ──────────────────────────────────────────────
+mlb_environment:
+  provider: "nws_api"
+  nws_base_url: "https://api.weather.gov"
+  user_agent: "dk-prediction-private-research (local)"
+  max_events_per_run: 12
+  request_delay_sec: 1.0
+  forecast_lookahead_hours: 96
+
 splits:
   url: "https://www.actionnetwork.com/ncaab/public-betting"
   headless: true
@@ -50,6 +58,7 @@ splits:
 
 # API/private UI boundary
 api:
+  enable_docs: false
   allowed_origins:
     - "http://localhost:8501"
     - "http://127.0.0.1:8501"

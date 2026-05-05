@@ -83,6 +83,100 @@ def test_add_entry_ev_targets_uses_american_odds_and_pushes():
     assert out.loc[0, "break_even_prob"] == pytest.approx(110 / 210)
 
 
+def test_add_entry_ev_targets_supports_mlb_event_specific_markets():
+    df = pd.DataFrame(
+        [
+            {
+                "event_id": 1,
+                "start_time_utc": datetime(2026, 1, 1, tzinfo=timezone.utc),
+                "sport": "baseball_mlb",
+                "league_key": "mlb",
+                "market": "batter_hits",
+                "side": "over",
+                "participant_name": "Home Hitter",
+                "participant_entity_type": "player",
+                "participant_player_id": 44,
+                "implied_T60": 0.52,
+                "line_T60": 1.5,
+                "price_american_T60": -110,
+                "total_over_T60": 1,
+            }
+        ]
+    )
+
+    out = add_entry_ev_targets(df, "T60")
+
+    assert out.loc[0, "target_outcome"] == 1
+    assert out.loc[0, "settlement_status"] == "win"
+
+
+def test_generate_oof_entry_ev_preserves_participant_identity():
+    case_dir = _case_dir("participant_identity")
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    rows = []
+    for event_id in range(16):
+        rows.append(
+            {
+                "event_id": event_id,
+                "start_time_utc": start + timedelta(days=event_id),
+                "sport": "baseball_mlb",
+                "league_key": "mlb",
+                "market": "team_totals",
+                "side": "over",
+                "participant_name": f"Team {event_id}",
+                "participant_entity_type": "team",
+                "participant_team_id": 1000 + event_id,
+                "implied_T60": 0.49 + event_id * 0.002,
+                "line_T60": 4.5,
+                "price_american_T60": -110,
+                "total_over_T60": 1 if event_id % 2 == 0 else 0,
+            }
+        )
+    path = case_dir / "features.parquet"
+    pd.DataFrame(rows).to_parquet(path, index=False)
+
+    result = generate_oof_entry_ev(
+        input_parquet=path,
+        anchor="T60",
+        sport="baseball_mlb",
+        out_dir=case_dir / "entry_ev",
+        min_train_size=4,
+        min_fold_train_rows=4,
+        n_folds=3,
+    )
+
+    predictions = pd.read_parquet(result.predictions_path)
+    assert not predictions.empty
+    assert {
+        "participant_name",
+        "participant_entity_type",
+        "participant_team_id",
+    }.issubset(predictions.columns)
+    assert predictions["participant_name"].str.startswith("Team ").all()
+
+
+def test_generate_oof_entry_ev_treats_sparse_optional_features_as_model_context():
+    case_dir = _case_dir("sparse_optional_features")
+    df = _feature_frame(24)
+    df["optional_statcast_context"] = [None] * len(df)
+    df.loc[df.index[::5], "optional_statcast_context"] = 0.42
+    path = case_dir / "features.parquet"
+    df.to_parquet(path, index=False)
+
+    result = generate_oof_entry_ev(
+        input_parquet=path,
+        anchor="T60",
+        out_dir=case_dir / "entry_ev",
+        min_train_size=4,
+        min_fold_train_rows=4,
+        n_folds=3,
+    )
+
+    predictions = pd.read_parquet(result.predictions_path)
+    assert not predictions.empty
+    assert result.summary["rows_modelable"] == 24
+
+
 def test_generate_oof_entry_ev_writes_artifact_bundle():
     case_dir = _case_dir("artifact_bundle")
     df = _feature_frame()

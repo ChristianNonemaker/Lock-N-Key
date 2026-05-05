@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 
 import httpx
 from sqlalchemy import create_engine
@@ -12,11 +12,15 @@ from dk_ncaab.db.models import (
     Event,
     EventProviderKey,
     EventResult,
+    League,
+    MlbEventVenue,
     MlbPlayerGameLog,
     MlbProbableStarter,
     MlbStatsRawPayload,
     MlbTeamGameLog,
+    MlbVenue,
     Player,
+    Team,
 )
 
 
@@ -45,6 +49,7 @@ def _schedule_payload() -> dict:
                     {
                         "gamePk": 777,
                         "gameDate": "2026-04-20T23:10:00Z",
+                        "venue": {"id": 17, "name": "Wrigley Field"},
                         "status": {"abstractGameState": "Final", "detailedState": "Final"},
                         "teams": {
                             "away": {
@@ -150,11 +155,17 @@ def test_collect_mlb_stats_upserts_provider_backed_logs_idempotently():
         assert session.query(Event).count() == 1
         assert session.query(EventProviderKey).count() == 1
         assert session.query(EventResult).count() == 1
+        assert session.query(MlbVenue).count() == 1
+        assert session.query(MlbEventVenue).count() == 1
         assert session.query(Player).count() == 4
         assert session.query(MlbTeamGameLog).count() == 2
         assert session.query(MlbPlayerGameLog).count() == 4
         assert session.query(MlbProbableStarter).count() == 2
         assert session.query(MlbStatsRawPayload).count() == 2
+        venue = session.query(MlbVenue).one()
+        assert venue.name == "Wrigley Field"
+        assert venue.latitude is not None
+        assert venue.roof_type == "open"
 
         again = collect_mlb_stats(
             start_date=date(2026, 4, 20),
@@ -194,3 +205,57 @@ def test_collect_mlb_stats_respects_boxscore_cap():
         assert session.query(MlbTeamGameLog).count() == 0
         assert all("/boxscore" not in call for call in client.calls)
         assert session.query(MlbStatsRawPayload).count() == 1
+
+
+def test_collect_mlb_stats_reuses_existing_same_game_event_with_lineage():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, expire_on_commit=False)
+    client = FakeMlbClient()
+
+    with Session() as session:
+        league = League(key="mlb", name="MLB")
+        session.add(league)
+        session.flush()
+
+        away = Team(league_id=league.id, name="Away Bats", normalized_name="away bats")
+        home = Team(league_id=league.id, name="Home Bats", normalized_name="home bats")
+        session.add_all([away, home])
+        session.flush()
+
+        existing = Event(
+            league_id=league.id,
+            external_event_key="odds-777",
+            start_time_utc=datetime(2026, 4, 20, 23, 20, tzinfo=timezone.utc),
+            home_team_id=home.id,
+            away_team_id=away.id,
+            status="upcoming",
+        )
+        session.add(existing)
+        session.flush()
+        session.add(
+            EventProviderKey(
+                event_id=existing.id,
+                sport_key="baseball_mlb",
+                provider="odds_api",
+                provider_event_key="odds-777",
+            )
+        )
+        session.commit()
+        session.close()
+
+    with Session() as session:
+        result = collect_mlb_stats(
+            start_date=date(2026, 4, 20),
+            end_date=date(2026, 4, 20),
+            client=client,
+            session=session,
+        )
+
+        assert result.events_created == 0
+        assert session.query(Event).count() == 1
+        assert session.query(EventProviderKey).filter_by(event_id=existing.id).count() == 2
+        assert session.query(EventProviderKey).filter_by(
+            provider="mlb_stats_api",
+            provider_event_key="777",
+        ).one().event_id == existing.id

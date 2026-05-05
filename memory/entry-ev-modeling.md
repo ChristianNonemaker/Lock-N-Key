@@ -1,6 +1,6 @@
 # Entry-Time EV Modeling
 
-Last reviewed: 2026-04-22
+Last reviewed: 2026-04-24
 
 ## Summary
 
@@ -33,9 +33,22 @@ Entry-time EV work has started with the required foundations:
 - `tests/test_entry_ev.py`
 - `tests/test_oof_entry_ev_artifacts.py`
 
+## Current Local State
+
+- A fresh local parquet now exists at `artifacts/parquet/features_20260425.parquet`.
+- `python -m dk_ncaab oof-entry-ev --input-parquet artifacts/parquet/features_20260425.parquet --sport baseball_mlb --anchor T60` now succeeds locally.
+- The first strict MLB artifact lives at `artifacts/entry_ev/oof/20260425T044212Z_T60_logreg`.
+- Current summary:
+  - `rows_input`: 1332
+  - `rows_modelable`: 50
+  - `events_modelable`: 13
+  - `rows_predicted`: 26
+  - `recommended_count`: 5
+  - `recommended_roi`: `-18.6%`
+- This is enough to validate the strict artifact path, but not enough data to treat MLB thresholds or ROI as stable.
+
 ## Still Pending
 
-- Fresh historical OOF artifact generation from a populated SQLite database/parquet export that includes `price_american_<anchor>`.
 - Calibrated outcome probabilities by sport/market/anchor, not just close-implied proxy predictions.
 - UI/API surfacing of artifact details beyond the latest summary.
 - Anchor-truncated volatility features; current full pre-tip volatility is excluded from entry feature selection because it leaks future movement.
@@ -45,7 +58,7 @@ Entry-time EV work has started with the required foundations:
 Run after rebuilding a feature parquet from a populated DB:
 
 ```bash
-python -m dk_ncaab oof-entry-ev --input-parquet artifacts/parquet/features_YYYYMMDD.parquet --anchor T60
+python -m dk_ncaab oof-entry-ev --input-parquet artifacts/parquet/features_YYYYMMDD.parquet --sport baseball_mlb --anchor T60
 ```
 
 The command intentionally fails if `price_american_<anchor>` is missing. Older

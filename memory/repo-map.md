@@ -1,50 +1,47 @@
 # Repo Map
 
-Last reviewed: 2026-04-22
+Last reviewed: 2026-05-05
 
 ## Source Of Truth
 
-- Product goal: `directions.md`
-- Current delivery plan: `plans/master-execution-plan.md`
-- GCP/private VM plan: `plans/gcp-vm-orchestration-plan.md`
-- Existing Copilot guidance: `.github/copilot-instructions.md`
-- Codex guidance: `AGENTS.md`
+- Product direction: `directions.md`
+- Deployment stabilization: `plans/deployment-stabilization-plan.md`
+- Private dashboard roadmap: `plans/private-odds-dashboard-roadmap.md`
+- Active sprint plan: `plans/three-sprint-odds-workstation-plan.md`
+- Production foundation: `plans/production-foundation.md`
+- Agent rules: `AGENTS.md` and `.github/copilot-instructions.md`
+
+Old sprint/orchestration docs live under `plans/archive/2026-05-stale/`.
 
 ## Main Packages
 
-- `dk_ncaab/config/`: sport/provider registry plus typed settings from `settings.yaml` with `DKNCAAB_` env overrides.
-- `dk_ncaab/db/`: SQLAlchemy models, session factory, Alembic migration.
-- `dk_ncaab/collectors/`: ESPN, The Odds API, Action Network splits, KenPom/AP imports.
-- `dk_ncaab/etl/`: normalization, snapshot extraction, feature generation.
-- `dk_ncaab/analysis/`: parquet dataset build, models, model store, backtests, reports.
-- `dk_ncaab/jobs/`: auto collector and legacy scheduler.
-- `api/`: FastAPI read-only service.
+- `dk_ncaab/config/`: settings, sport registry, prop registry.
+- `dk_ncaab/db/`: SQLAlchemy models, session, Alembic migrations.
+- `dk_ncaab/collectors/`: ESPN, odds, event odds, MLB stats/environment/identity.
+- `dk_ncaab/etl/`: normalization, snapshots, features, outcomes.
+- `dk_ncaab/analysis/`: dataset, strict EV, readiness, history, evidence growth.
+- `api/`: read-only FastAPI.
 - `ui/`: Streamlit dashboard.
-- `scripts/`: deployment, cron, health, backup, debugging, diagnostics.
+- `scripts/`: ops scripts and diagnostics.
 
 ## Common Commands
 
-- Install: `pip install -e ".[dev]"`
-- Playwright runtime: `playwright install chromium`
-- Migrate: `alembic upgrade head`
-- CLI help: `python -m dk_ncaab --help`
-- Tests: `pytest tests/ -v`
-- API: `uvicorn api.main:app --reload --port 8000`
-- UI: `streamlit run ui/app.py`
-- Strict entry-EV artifacts: `python -m dk_ncaab oof-entry-ev --input-parquet artifacts/parquet/features_YYYYMMDD.parquet --anchor T60`
-- Populated board screenshots without live API calls: `python scripts/check_sportsbook_board_screenshots.py`
-- Docker dev: `docker compose up -d`
+```bash
+pip install -e ".[dev]"
+alembic upgrade head
+python -m dk_ncaab --help
+python -m dk_ncaab status
+pytest tests -q
+ruff check api ui dk_ncaab tests
+uvicorn api.main:app --host 127.0.0.1 --port 8000
+streamlit run ui/app.py --server.address 127.0.0.1
+python scripts/check_sportsbook_board_screenshots.py
+```
 
-## Important Conventions
+## Conventions
 
-- Odds and splits are append-style time series.
-- Snapshots are derived at query time, not stored in a snapshot table.
-- `selected_event_id` is the Streamlit session-state handoff between non-board game selection pages and detail/model pages.
-- Sportsbook Board URL state uses query params (`page`, `sport`, `mode`, `date`, `event_id`) and persists its private watchlist in `artifacts/state/research_watchlist.json`.
-- Current active registry sports: NCAAB, NCAAF, NFL, MLB. NBA and soccer are disabled planned entries.
-
-## Watch For
-
-- Existing worktree may be dirty. Do not revert user changes.
-- Some files contain mojibake in comments/docstrings from prior encoding issues. Avoid broad formatting churn unless requested.
-- Scripts under `scripts/test_*.py` are diagnostics, not the same as pytest regression tests.
+- Production DB is SQLite.
+- Production API/UI are localhost-bound and published only via Tailscale Serve.
+- Bare pytest should collect only `tests/`.
+- Script probes live in `scripts/diagnostics/`; they are not regression tests.
+- Generated data lives under `artifacts/` or `temp/` and is ignored.

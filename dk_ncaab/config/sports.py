@@ -122,7 +122,7 @@ _SPORT_SPECS: tuple[SportSpec, ...] = (
         team_stats_source="mlb_stats_api_boxscore",
         player_stats_source="mlb_stats_api_boxscore",
         injuries_source=None,
-        props_source=None,
+        props_source="the_odds_api_event_odds",
         feature_enrichers=("odds_snapshots", "mlb_stats"),
         espn_scoreboard_url=(
             "https://site.api.espn.com/apis/site/v2/sports/"
@@ -132,7 +132,11 @@ _SPORT_SPECS: tuple[SportSpec, ...] = (
         odds_enabled_by_default=True,
         odds_collectable=True,
         ui_enabled=True,
-        notes="The current quota-safe default odds target; MLB Stats API backs team/player trends.",
+        notes=(
+            "The current quota-safe default odds target; MLB Stats API backs team/player trends. "
+            "Event-specific MLB team totals and player props are registry-defined but must stay "
+            "bounded and manual until quota behavior is proven."
+        ),
     ),
     SportSpec(
         key="basketball_nba",
@@ -148,12 +152,16 @@ _SPORT_SPECS: tuple[SportSpec, ...] = (
         player_stats_source=None,
         injuries_source=None,
         props_source=None,
-        feature_enrichers=(),
+        feature_enrichers=("odds_snapshots",),
         espn_scoreboard_url=(
             "https://site.api.espn.com/apis/site/v2/sports/"
             "basketball/nba/scoreboard"
         ),
-        notes="Provider contracts and tests must land before collection or UI eligibility.",
+        schedule_enabled_by_default=False,
+        odds_enabled_by_default=False,
+        odds_collectable=False,
+        ui_enabled=False,
+        notes="Planned placeholder until provider mappings, quota cadence, and tests are ready.",
     ),
     SportSpec(
         key="soccer_epl",
@@ -161,16 +169,24 @@ _SPORT_SPECS: tuple[SportSpec, ...] = (
         league_key="epl",
         league_name="English Premier League",
         status="planned",
-        schedule_source=None,
-        odds_api_sport=None,
-        results_source=None,
+        schedule_source="espn_scoreboard",
+        odds_api_sport="soccer_epl",
+        results_source="espn_scoreboard",
         splits_source=None,
         team_stats_source=None,
         player_stats_source=None,
         injuries_source=None,
         props_source=None,
-        feature_enrichers=(),
-        notes="Soccer has provider-specific league keys; verify ESPN and The Odds API mappings before enabling.",
+        feature_enrichers=("odds_snapshots",),
+        espn_scoreboard_url=(
+            "https://site.api.espn.com/apis/site/v2/sports/"
+            "soccer/eng.1/scoreboard"
+        ),
+        schedule_enabled_by_default=False,
+        odds_enabled_by_default=False,
+        odds_collectable=False,
+        ui_enabled=False,
+        notes="Planned placeholder until provider mappings, quota cadence, and tests are ready.",
     ),
 )
 

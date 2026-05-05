@@ -14,9 +14,10 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from dk_ncaab.config.mlb_venues import lookup_mlb_venue
 from dk_ncaab.config.sports import league_for_sport
 from dk_ncaab.config.settings import get_settings
 from dk_ncaab.db.models import (
@@ -24,10 +25,12 @@ from dk_ncaab.db.models import (
     EventProviderKey,
     EventResult,
     League,
+    MlbEventVenue,
     MlbPlayerGameLog,
     MlbProbableStarter,
     MlbStatsRawPayload,
     MlbTeamGameLog,
+    MlbVenue,
     Player,
     Team,
 )
@@ -46,6 +49,7 @@ class MlbStatsResult:
     events_created: int
     results_upserted: int
     boxscores_fetched: int
+    boxscores_skipped_existing: int
     team_logs_upserted: int
     player_logs_upserted: int
     probable_starters_upserted: int
@@ -53,6 +57,14 @@ class MlbStatsResult:
 
 def _parse_dt(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+
+
+def _ensure_utc(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def _int(value: Any) -> int | None:
@@ -175,21 +187,44 @@ def _find_or_create_event(
     start = _parse_dt(game["gameDate"])
     home = _team_from_game(session, league, game, "home")
     away = _team_from_game(session, league, game, "away")
-    window_start = start - timedelta(hours=8)
-    window_end = start + timedelta(hours=8)
-    existing = session.execute(
-        select(Event).where(
-            Event.league_id == league.id,
-            Event.home_team_id.in_([home.id, away.id]),
-            Event.away_team_id.in_([home.id, away.id]),
-            Event.start_time_utc >= window_start,
-            Event.start_time_utc <= window_end,
-        )
-    ).scalars().all()
-    existing = next(
-        (event for event in existing if {event.home_team_id, event.away_team_id} == {home.id, away.id}),
-        None,
+    window_start = start - timedelta(minutes=90)
+    window_end = start + timedelta(minutes=90)
+    raw_candidates = list(
+        session.execute(
+            select(Event).where(
+                Event.league_id == league.id,
+                Event.home_team_id == home.id,
+                Event.away_team_id == away.id,
+                Event.start_time_utc >= window_start,
+                Event.start_time_utc <= window_end,
+            )
+        ).scalars()
     )
+    candidates: list[Event] = []
+    for event in raw_candidates:
+        existing_provider = session.execute(
+            select(EventProviderKey).where(
+                EventProviderKey.event_id == event.id,
+                EventProviderKey.provider == PROVIDER,
+            )
+        ).scalar_one_or_none()
+        if existing_provider is not None and existing_provider.provider_event_key != game_pk:
+            continue
+        candidates.append(event)
+
+    def sort_key(event: Event) -> tuple[int, int, float, int]:
+        provider_keys = (
+            session.execute(
+                select(func.count(EventProviderKey.id)).where(EventProviderKey.event_id == event.id)
+            ).scalar_one()
+            or 0
+        )
+        has_result = 1 if event.result is not None else 0
+        existing_start = _ensure_utc(event.start_time_utc) or start
+        distance_sec = abs((existing_start - start).total_seconds())
+        return (-int(provider_keys), -has_result, distance_sec, event.id)
+
+    existing = sorted(candidates, key=sort_key)[0] if candidates else None
 
     created = False
     if existing is None:
@@ -209,14 +244,21 @@ def _find_or_create_event(
         existing.start_time_utc = start
         existing.status = _status_from_mlb(game)
 
-    session.add(
-        EventProviderKey(
-            event_id=existing.id,
-            sport_key=SPORT_KEY,
-            provider=PROVIDER,
-            provider_event_key=game_pk,
+    existing_provider_key = session.execute(
+        select(EventProviderKey).where(
+            EventProviderKey.provider == PROVIDER,
+            EventProviderKey.provider_event_key == game_pk,
         )
-    )
+    ).scalar_one_or_none()
+    if existing_provider_key is None:
+        session.add(
+            EventProviderKey(
+                event_id=existing.id,
+                sport_key=SPORT_KEY,
+                provider=PROVIDER,
+                provider_event_key=game_pk,
+            )
+        )
     session.flush()
     return existing, created
 
@@ -237,6 +279,45 @@ def _archive_raw(
             payload_json=payload,
         )
     )
+
+
+def _upsert_event_venue(session: Session, event: Event, game: dict[str, Any]) -> bool:
+    venue_payload = game.get("venue") or {}
+    venue_key = str(venue_payload.get("id") or "").strip()
+    venue_name = (venue_payload.get("name") or "").strip()
+    if not venue_key and not venue_name:
+        return False
+    if not venue_key:
+        venue_key = venue_name.lower()
+
+    spec = lookup_mlb_venue(venue_name)
+    values = {
+        "name": venue_name or (spec.name if spec else venue_key),
+        "latitude": spec.latitude if spec else None,
+        "longitude": spec.longitude if spec else None,
+        "roof_type": spec.roof_type if spec else None,
+        "park_factor_runs": spec.park_factor_runs if spec else None,
+        "park_factor_hr": spec.park_factor_hr if spec else None,
+        "source": "mlb_stats_schedule",
+        "notes": spec.notes if spec else "Venue coordinates pending manual review.",
+    }
+    venue, venue_created = _upsert(
+        session,
+        MlbVenue,
+        {"provider": PROVIDER, "provider_venue_key": venue_key},
+        values,
+    )
+    _, event_venue_created = _upsert(
+        session,
+        MlbEventVenue,
+        {"event_id": event.id},
+        {
+            "venue_id": venue.id,
+            "provider": PROVIDER,
+            "collected_at_utc": datetime.now(timezone.utc),
+        },
+    )
+    return bool(venue_created or event_venue_created)
 
 
 def _upsert_result(session: Session, event: Event, game: dict[str, Any]) -> bool:
@@ -440,6 +521,18 @@ def _date_range(start: date, end: date) -> tuple[str, str]:
     return start.isoformat(), end.isoformat()
 
 
+def _has_existing_boxscore_logs(session: Session, event_id: int) -> bool:
+    team_logs = session.execute(
+        select(func.count(MlbTeamGameLog.id)).where(MlbTeamGameLog.event_id == event_id)
+    ).scalar_one()
+    if int(team_logs or 0) < 2:
+        return False
+    player_logs = session.execute(
+        select(func.count(MlbPlayerGameLog.id)).where(MlbPlayerGameLog.event_id == event_id)
+    ).scalar_one()
+    return int(player_logs or 0) > 0
+
+
 def collect_mlb_stats(
     start_date: date | None = None,
     end_date: date | None = None,
@@ -448,6 +541,7 @@ def collect_mlb_stats(
     final_only: bool = True,
     max_boxscores: int | None = None,
     request_delay_sec: float | None = None,
+    skip_existing_boxscores: bool = True,
     client: httpx.Client | None = None,
     session: Session | None = None,
 ) -> MlbStatsResult:
@@ -474,6 +568,7 @@ def collect_mlb_stats(
     events_created = 0
     results_upserted = 0
     boxscores_fetched = 0
+    boxscores_skipped_existing = 0
     team_logs_upserted = 0
     player_logs_upserted = 0
     probable_starters_upserted = 0
@@ -496,6 +591,7 @@ def collect_mlb_stats(
                 schedule_games += 1
                 event, created = _find_or_create_event(session, league, game)
                 events_created += int(created)
+                _upsert_event_venue(session, event, game)
                 home = session.get(Team, event.home_team_id)
                 away = session.get(Team, event.away_team_id)
                 if home is None or away is None:
@@ -513,6 +609,9 @@ def collect_mlb_stats(
                 results_upserted += int(_upsert_result(session, event, game))
 
                 if final_only and _status_from_mlb(game) != "final":
+                    continue
+                if skip_existing_boxscores and _has_existing_boxscore_logs(session, event.id):
+                    boxscores_skipped_existing += 1
                     continue
                 if max_boxscores >= 0 and boxscores_fetched >= max_boxscores:
                     if not boxscore_cap_logged:
@@ -558,6 +657,7 @@ def collect_mlb_stats(
         events_created=events_created,
         results_upserted=results_upserted,
         boxscores_fetched=boxscores_fetched,
+        boxscores_skipped_existing=boxscores_skipped_existing,
         team_logs_upserted=team_logs_upserted,
         player_logs_upserted=player_logs_upserted,
         probable_starters_upserted=probable_starters_upserted,

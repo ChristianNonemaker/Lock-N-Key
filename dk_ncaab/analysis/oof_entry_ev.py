@@ -28,6 +28,9 @@ from dk_ncaab.analysis.settlement import (
 from dk_ncaab.config.settings import get_settings
 
 DEFAULT_OUT_DIR = Path("artifacts/entry_ev/oof")
+MIN_PROMOTION_OOF_ROWS = 100
+MIN_PROMOTION_SETTLED_EVENTS = 30
+MIN_PROMOTION_POSTED_LINE_SAMPLES = 10
 
 
 @dataclass(frozen=True)
@@ -75,7 +78,13 @@ def target_column_for(row: pd.Series, anchor: str) -> str:
         return "home_win" if side == "home" else "away_win"
     if market == "spread":
         return f"spread_cover_{anchor}"
-    if market == "total":
+    if market in (
+        "total",
+        "team_totals",
+        "pitcher_strikeouts",
+        "batter_hits",
+        "batter_total_bases",
+    ):
         return f"total_over_{anchor}"
     raise ValueError(f"Unsupported market/side for EV target: {market}/{side}")
 
@@ -162,7 +171,6 @@ def _modelable_frame(df: pd.DataFrame, anchor: str, sport: str | None) -> tuple[
         if col not in artifact_only
     ]
     required = [
-        *features,
         "target_outcome",
         "event_id",
         "start_time_utc",
@@ -174,6 +182,7 @@ def _modelable_frame(df: pd.DataFrame, anchor: str, sport: str | None) -> tuple[
         raise ValueError(f"Missing model-ready columns: {', '.join(missing)}")
     modelable = df.dropna(subset=required).copy()
     modelable = modelable[modelable["settlement_status"].isin(["win", "loss"])]
+    features = [col for col in features if modelable[col].notna().any()]
     return modelable, features
 
 
@@ -212,9 +221,17 @@ def generate_oof_entry_ev(
     )
 
     for fold_id, (train_df, test_df) in enumerate(splits):
-        X_train = train_df[features].dropna()
+        train_features = train_df[features]
+        feature_medians = train_features.median()
+        active_features = [
+            col for col in features
+            if col in feature_medians.index and not pd.isna(feature_medians[col])
+        ]
+        if not active_features:
+            continue
+        X_train = train_features[active_features].fillna(feature_medians[active_features])
         y_train = train_df.loc[X_train.index, "target_outcome"].astype(int)
-        X_test = test_df[features].dropna()
+        X_test = test_df[active_features].fillna(feature_medians[active_features])
         if len(X_train) < min_fold_train_rows or len(X_test) < 1 or y_train.nunique() < 2:
             continue
 
@@ -248,6 +265,10 @@ def generate_oof_entry_ev(
         "league_key",
         "market",
         "side",
+        "participant_name",
+        "participant_entity_type",
+        "participant_team_id",
+        "participant_player_id",
         "anchor",
         "entry_implied",
         "entry_line",
@@ -282,6 +303,27 @@ def generate_oof_entry_ev(
 
     recommended = predictions[predictions["recommended"]]
     settled = recommended[recommended["settlement_status"].isin(["win", "loss", "push"])]
+    rows_predicted_by_market = (
+        predictions["market"].value_counts().sort_index().astype(int).to_dict()
+        if not predictions.empty
+        else {}
+    )
+    recommended_by_market = (
+        recommended["market"].value_counts().sort_index().astype(int).to_dict()
+        if not recommended.empty
+        else {}
+    )
+    promotion_gaps: list[str] = []
+    if len(predictions) < MIN_PROMOTION_OOF_ROWS:
+        promotion_gaps.append("oof_sample_below_gate")
+    settled_events = int(settled["event_id"].nunique()) if not settled.empty else 0
+    if settled_events < MIN_PROMOTION_SETTLED_EVENTS:
+        promotion_gaps.append("settled_events_below_gate")
+    if recommended.empty:
+        promotion_gaps.append("no_recommended_rows")
+    if not recommended.empty and float(settled["actual_profit_units_1u"].sum() / len(settled)) <= 0:
+        promotion_gaps.append("non_positive_recommended_roi")
+    promotion_status = "promotable" if not promotion_gaps else "sample_sensitive"
     summary = {
         "generated_at_utc": generated_at.isoformat(),
         "input_path": input_path,
@@ -294,6 +336,13 @@ def generate_oof_entry_ev(
         "events_modelable": int(modelable["event_id"].nunique()),
         "feature_count": len(features),
         "recommended_count": int(len(recommended)),
+        "promotion_status": promotion_status,
+        "promotion_gaps": promotion_gaps,
+        "min_oof_rows": MIN_PROMOTION_OOF_ROWS,
+        "min_settled_events": MIN_PROMOTION_SETTLED_EVENTS,
+        "min_posted_line_samples": MIN_PROMOTION_POSTED_LINE_SAMPLES,
+        "rows_predicted_by_market": rows_predicted_by_market,
+        "recommended_by_market": recommended_by_market,
         "recommended_profit_units": float(settled["actual_profit_units_1u"].sum())
         if not settled.empty
         else 0.0,

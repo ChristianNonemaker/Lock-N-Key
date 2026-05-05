@@ -33,7 +33,7 @@ from dk_ncaab.config.sports import (
     league_for_sport,
     sport_for_league_key,
 )
-from dk_ncaab.db.models import League, Event, EventResult
+from dk_ncaab.db.models import Event, EventProviderKey, EventResult, League
 from dk_ncaab.db.session import SessionLocal
 from dk_ncaab.etl.normalize import resolve_team, get_or_create_team
 
@@ -41,6 +41,14 @@ log = logging.getLogger(__name__)
 
 # ESPN event status mapping
 _STATUS_MAP = {"pre": "upcoming", "in": "live", "post": "final"}
+
+
+def _ensure_utc(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 # ── Public entrypoints ──────────────────────────────────────────
@@ -312,6 +320,93 @@ def _ensure_league(session: Session, sport: str) -> League:
     return league
 
 
+def _espn_external_event_key(sport: str, espn_id: str) -> str:
+    """Build the canonical ESPN provider event key for a sport/event id."""
+    if sport == "basketball_ncaab":
+        return f"espn:{espn_id}"
+    return f"espn:{sport}:{espn_id}"
+
+
+def _find_event_by_espn_key(
+    session: Session,
+    external_key: str,
+) -> Event | None:
+    event = session.query(Event).filter_by(external_event_key=external_key).first()
+    if event is not None:
+        return event
+
+    provider_key = (
+        session.query(EventProviderKey)
+        .filter_by(provider="espn", provider_event_key=external_key)
+        .first()
+    )
+    if provider_key is None:
+        return None
+    return session.query(Event).filter_by(id=provider_key.event_id).first()
+
+
+def _match_existing_event(
+    session: Session,
+    *,
+    home_team_id: int,
+    away_team_id: int,
+    start_utc: datetime,
+) -> Event | None:
+    window_start = start_utc - timedelta(hours=6)
+    window_end = start_utc + timedelta(hours=6)
+    candidates = list(
+        session.query(Event)
+        .filter(
+            Event.home_team_id == home_team_id,
+            Event.away_team_id == away_team_id,
+            Event.start_time_utc >= window_start,
+            Event.start_time_utc <= window_end,
+        )
+    )
+    if not candidates:
+        return None
+
+    def sort_key(event: Event) -> tuple[int, int, float, int]:
+        provider_keys = (
+            session.query(EventProviderKey)
+            .filter(EventProviderKey.event_id == event.id)
+            .count()
+        )
+        has_result = 1 if event.result is not None else 0
+        distance_sec = abs(
+            ((_ensure_utc(event.start_time_utc) or start_utc) - start_utc).total_seconds()
+        )
+        return (-provider_keys, -has_result, distance_sec, event.id)
+
+    return sorted(candidates, key=sort_key)[0]
+
+
+def _ensure_espn_provider_key(
+    session: Session,
+    *,
+    event: Event,
+    sport: str,
+    external_key: str,
+) -> None:
+    existing = (
+        session.query(EventProviderKey)
+        .filter_by(provider="espn", provider_event_key=external_key)
+        .first()
+    )
+    if existing is not None:
+        return
+
+    session.add(
+        EventProviderKey(
+            event_id=event.id,
+            sport_key=sport,
+            provider="espn",
+            provider_event_key=external_key,
+        )
+    )
+    session.flush()
+
+
 # ── Event processing ────────────────────────────────────────────
 
 def _process_espn_event(
@@ -325,8 +420,7 @@ def _process_espn_event(
     Returns (created, score_added, status_updated) — each 0 or 1.
     """
     espn_id = str(ev["id"])
-    # Backward-compatible for existing NCAAB rows.
-    external_key = f"espn:{espn_id}" if sport == "basketball_ncaab" else f"espn:{sport}:{espn_id}"
+    external_key = _espn_external_event_key(sport, espn_id)
 
     # Parse competitors
     competitions = ev.get("competitions", [])
@@ -374,25 +468,37 @@ def _process_espn_event(
         else datetime.now(timezone.utc)
     )
 
-    # ── Check if event already exists ──
-    existing = (
-        session.query(Event)
-        .filter_by(external_event_key=external_key)
-        .first()
-    )
+    home_team = _resolve_or_create(session, home_raw, league.id)
+    away_team = _resolve_or_create(session, away_raw, league.id)
+
+    existing = _find_event_by_espn_key(session, external_key)
+    if existing is None:
+        existing = _match_existing_event(
+            session,
+            home_team_id=home_team.id,
+            away_team_id=away_team.id,
+            start_utc=start_utc,
+        )
+        if existing is not None:
+            log.info(
+                "Matched ESPN event %s to existing %s (id=%d): %s @ %s",
+                external_key,
+                existing.external_event_key,
+                existing.id,
+                away_raw,
+                home_raw,
+            )
 
     created = 0
     status_updated = 0
     if existing:
         event = existing
+        event.start_time_utc = start_utc
         # Update status if it progressed
         if event.status != "final" and event.status != db_status and db_status in ("live", "final"):
             event.status = db_status
             status_updated = 1
     else:
-        # Resolve/create teams and insert event
-        home_team = _resolve_or_create(session, home_raw, league.id)
-        away_team = _resolve_or_create(session, away_raw, league.id)
         event = Event(
             league_id=league.id,
             external_event_key=external_key,
@@ -409,6 +515,8 @@ def _process_espn_event(
             away_raw, home_raw,
             start_utc.strftime("%H:%M UTC"), db_status,
         )
+
+    _ensure_espn_provider_key(session, event=event, sport=sport, external_key=external_key)
 
     # ── Capture scores for completed games ──
     score_added = 0

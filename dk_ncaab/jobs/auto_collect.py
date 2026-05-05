@@ -44,11 +44,8 @@ from typing import NamedTuple
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
-from sqlalchemy.exc import OperationalError as SAOperationalError
-
-from dk_ncaab.config.settings import get_settings
 from dk_ncaab.db.session import SessionLocal
-from dk_ncaab.db.models import Event, EventResult, OddsQuote
+from dk_ncaab.db.models import Event, OddsQuote
 
 log = logging.getLogger(__name__)
 

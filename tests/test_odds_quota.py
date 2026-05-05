@@ -9,7 +9,7 @@ from sqlalchemy.orm import sessionmaker
 
 from dk_ncaab.collectors import odds_api
 from dk_ncaab.config.settings import OddsApiCfg
-from dk_ncaab.db.models import Base, OddsApiUsage
+from dk_ncaab.db.models import Base, Event, EventProviderKey, League, OddsApiUsage, Team
 
 
 @pytest.fixture
@@ -196,3 +196,101 @@ def test_collect_odds_passes_configured_request_attempt_cap(monkeypatch, session
 
     assert odds_api.collect_odds() == 0
     assert seen == {"sport": "baseball_mlb", "max_retries": 1}
+
+
+def test_upsert_event_reuses_existing_espn_event_and_attaches_odds_provider_key(session):
+    league = League(key="mlb", name="MLB")
+    session.add(league)
+    session.flush()
+
+    home = Team(league_id=league.id, name="New York Yankees", normalized_name="new york yankees")
+    away = Team(league_id=league.id, name="Boston Red Sox", normalized_name="boston red sox")
+    session.add_all([home, away])
+    session.flush()
+
+    existing = Event(
+        league_id=league.id,
+        external_event_key="espn:baseball_mlb:1234",
+        start_time_utc=datetime(2026, 4, 22, 23, 10, tzinfo=timezone.utc),
+        home_team_id=home.id,
+        away_team_id=away.id,
+        status="upcoming",
+    )
+    session.add(existing)
+    session.flush()
+    session.add(
+        EventProviderKey(
+            event_id=existing.id,
+            sport_key="baseball_mlb",
+            provider="espn",
+            provider_event_key="espn:baseball_mlb:1234",
+        )
+    )
+    session.commit()
+
+    payload = {
+        "id": "odds-abc",
+        "home_team": "New York Yankees",
+        "away_team": "Boston Red Sox",
+        "commence_time": "2026-04-22T23:10:00Z",
+    }
+
+    event = odds_api._upsert_event(session, league, "baseball_mlb", payload)
+    session.commit()
+
+    assert event.id == existing.id
+    assert session.query(Event).count() == 1
+    assert session.query(EventProviderKey).filter_by(
+        provider="odds_api",
+        provider_event_key="odds-abc",
+    ).one().event_id == existing.id
+
+
+def test_odds_match_prefers_event_with_provider_lineage(session):
+    league = League(key="mlb", name="MLB")
+    session.add(league)
+    session.flush()
+
+    home = Team(league_id=league.id, name="Mets", normalized_name="mets")
+    away = Team(league_id=league.id, name="Phillies", normalized_name="phillies")
+    session.add_all([home, away])
+    session.flush()
+
+    start = datetime(2026, 4, 22, 23, 10, tzinfo=timezone.utc)
+    weaker = Event(
+        league_id=league.id,
+        external_event_key="temp-a",
+        start_time_utc=start + timedelta(minutes=2),
+        home_team_id=home.id,
+        away_team_id=away.id,
+        status="upcoming",
+    )
+    stronger = Event(
+        league_id=league.id,
+        external_event_key="temp-b",
+        start_time_utc=start,
+        home_team_id=home.id,
+        away_team_id=away.id,
+        status="upcoming",
+    )
+    session.add_all([weaker, stronger])
+    session.flush()
+    session.add(
+        EventProviderKey(
+            event_id=stronger.id,
+            sport_key="baseball_mlb",
+            provider="espn",
+            provider_event_key="espn:baseball_mlb:555",
+        )
+    )
+    session.commit()
+
+    matched = odds_api._match_existing_event(
+        session,
+        home_team_id=home.id,
+        away_team_id=away.id,
+        start_utc=start,
+    )
+
+    assert matched is not None
+    assert matched.id == stronger.id

@@ -122,6 +122,50 @@ class TestSnapshotExtraction:
         assert snap.price_american != -200  # must NOT pick the post-tip row
         assert _strip_tz(snap.collected_at_utc) <= _strip_tz(event_with_quotes.start_time_utc)
 
+    def test_exact_tip_quote_is_excluded_from_close(self, session):
+        tip = datetime(2025, 3, 15, 19, 0, 0, tzinfo=timezone.utc)
+        session.add(Event(
+            id=3,
+            league_id=1,
+            external_event_key="test-003",
+            start_time_utc=tip,
+            home_team_id=1,
+            away_team_id=2,
+            first_seen_at_utc=tip - timedelta(hours=2),
+        ))
+        session.add_all(
+            [
+                OddsQuote(
+                    event_id=3,
+                    book="draftkings",
+                    market="spread",
+                    side="home",
+                    line=-3.5,
+                    price_american=-115,
+                    implied_probability=round(american_to_implied(-115), 6),
+                    collected_at_utc=tip - timedelta(minutes=5),
+                    source="test",
+                ),
+                OddsQuote(
+                    event_id=3,
+                    book="draftkings",
+                    market="spread",
+                    side="home",
+                    line=-4.0,
+                    price_american=-130,
+                    implied_probability=round(american_to_implied(-130), 6),
+                    collected_at_utc=tip,
+                    source="test",
+                ),
+            ]
+        )
+        session.flush()
+
+        snap = get_snapshot(session, 3, "spread", "home", "CLOSE")
+        assert snap is not None
+        assert snap.price_american == -115
+        assert _strip_tz(snap.collected_at_utc) == _strip_tz(tip - timedelta(minutes=5))
+
     def test_no_data_returns_none(self, session, event_with_quotes):
         """Querying a market/side with no quotes returns None."""
         snap = get_snapshot(session, 1, "moneyline", "home", "OPEN")
@@ -166,8 +210,9 @@ class TestEdgeCases:
         assert ss.OPEN is not None
         assert ss.CLOSE is not None
         assert ss.OPEN.price_american == ss.CLOSE.price_american
-        # T60 should be None (only quote is at T-60, which is at the boundary)
-        # T30 should be None (quote is at T-60, which is before T-30 cutoff)
+        assert ss.T60 is None
+        assert ss.T30 is not None
+        assert ss.T30.price_american == -150
 
     def test_nonexistent_event(self, session):
         snap = get_snapshot(session, 999, "spread", "home", "OPEN")

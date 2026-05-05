@@ -17,35 +17,36 @@ Builds a flat feature row per (event_id, market, side) with:
 
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Sequence
 
 import numpy as np
-from sqlalchemy import select, and_
+from sqlalchemy import and_, select
 from sqlalchemy.orm import Session
 
 from dk_ncaab.config.sports import sport_for_league_key
-from dk_ncaab.db.models import OddsQuote, Event, EventResult
+from dk_ncaab.db.models import Event, EventOddsQuote, OddsQuote
 from dk_ncaab.etl.snapshots import (
     get_snapshot_set,
     get_splits_snapshot,
-    Snapshot,
-    SplitsSnapshot,
     SnapshotSet,
 )
-from dk_ncaab.etl.normalize import american_to_implied, remove_vig
+from dk_ncaab.etl.normalize import remove_vig
 
 
 # ── Feature row ─────────────────────────────────────────────────
 
 @dataclass
 class FeatureRow:
-    """Flat feature vector for one (event_id, market, side)."""
+    """Flat feature vector for one (event_id, participant, market, side)."""
     event_id: int
     market: str
     side: str
+    participant_name: str | None = None
+    participant_entity_type: str | None = None
+    participant_team_id: int | None = None
+    participant_player_id: int | None = None
     start_time_utc: datetime | None = None
     sport: str | None = None
     league_key: str | None = None
@@ -198,6 +199,19 @@ class FeatureRow:
     away_mlb_starter_k_bb_l3: float | None = None
     home_mlb_starter_avg_ip_l3: float | None = None
     away_mlb_starter_avg_ip_l3: float | None = None
+    home_mlb_starter_statcast_whiff_rate_l3: float | None = None
+    away_mlb_starter_statcast_whiff_rate_l3: float | None = None
+    home_mlb_starter_statcast_csw_rate_l3: float | None = None
+    away_mlb_starter_statcast_csw_rate_l3: float | None = None
+    home_mlb_starter_statcast_hard_hit_rate_l3: float | None = None
+    away_mlb_starter_statcast_hard_hit_rate_l3: float | None = None
+    participant_statcast_xba_l5: float | None = None
+    participant_statcast_xslg_l5: float | None = None
+    participant_statcast_hard_hit_rate_l5: float | None = None
+    participant_statcast_barrel_rate_l5: float | None = None
+    participant_statcast_pitcher_whiff_rate_l3: float | None = None
+    participant_statcast_pitcher_csw_rate_l3: float | None = None
+    participant_statcast_pitcher_pitches_l3: float | None = None
 
     # ── Model expected value (§9) ──────────────────────────────
     model_expected_value: float | None = None  # model_prob - break_even_prob (filled post-model)
@@ -233,6 +247,10 @@ def _safe_delta(a: float | None, b: float | None) -> float | None:
 def _hours_between(t1: datetime | None, t2: datetime | None) -> float | None:
     if t1 is None or t2 is None:
         return None
+    if t2.tzinfo is not None and t1.tzinfo is None:
+        t1 = t1.replace(tzinfo=t2.tzinfo)
+    elif t2.tzinfo is None and t1.tzinfo is not None:
+        t2 = t2.replace(tzinfo=t1.tzinfo)
     diff = (t2 - t1).total_seconds() / 3600
     return diff if diff > 0 else None
 
@@ -251,21 +269,56 @@ def _compute_volatility(
     market: str,
     side: str,
     start_time_utc: datetime,
+    participant_name: str | None = None,
+    participant_entity_type: str | None = None,
+    participant_team_id: int | None = None,
+    participant_player_id: int | None = None,
 ) -> tuple[float | None, int | None, float | None]:
     """
     Returns (std_implied, n_price_changes, max_drawdown) from the
     full pre-tip quote series.
     """
-    stmt = (
-        select(OddsQuote.implied_probability)
-        .where(
-            OddsQuote.event_id == event_id,
-            OddsQuote.market == market,
-            OddsQuote.side == side,
-            OddsQuote.collected_at_utc <= start_time_utc,
-        )
-        .order_by(OddsQuote.collected_at_utc.asc())
+    is_event_odds = market in (
+        "team_totals",
+        "pitcher_strikeouts",
+        "batter_hits",
+        "batter_total_bases",
     )
+    if is_event_odds:
+        base = and_(
+            EventOddsQuote.event_id == event_id,
+            EventOddsQuote.book == "draftkings",
+            EventOddsQuote.market_key == market,
+            EventOddsQuote.side == side,
+            EventOddsQuote.collected_at_utc < start_time_utc,
+        )
+        if participant_entity_type:
+            base = and_(base, EventOddsQuote.entity_type == participant_entity_type)
+        if participant_player_id is not None:
+            base = and_(base, EventOddsQuote.player_id == participant_player_id)
+        elif participant_team_id is not None:
+            base = and_(base, EventOddsQuote.team_id == participant_team_id)
+        elif participant_name:
+            base = and_(base, EventOddsQuote.participant_name == participant_name)
+        else:
+            return None, 0, None
+        stmt = (
+            select(EventOddsQuote.implied_probability)
+            .where(base)
+            .order_by(EventOddsQuote.collected_at_utc.asc())
+        )
+    else:
+        stmt = (
+            select(OddsQuote.implied_probability)
+            .where(
+                OddsQuote.event_id == event_id,
+                OddsQuote.book == "draftkings",
+                OddsQuote.market == market,
+                OddsQuote.side == side,
+                OddsQuote.collected_at_utc < start_time_utc,
+            )
+            .order_by(OddsQuote.collected_at_utc.asc())
+        )
     probs = [r[0] for r in session.execute(stmt) if r[0] is not None]
 
     if len(probs) < 2:
@@ -292,12 +345,25 @@ def build_features(
     event_id: int,
     market: str,
     side: str,
+    participant_name: str | None = None,
+    participant_entity_type: str | None = None,
+    participant_team_id: int | None = None,
+    participant_player_id: int | None = None,
 ) -> FeatureRow:
-    """Build the complete feature row for one (event, market, side)."""
+    """Build the complete feature row for one (event, market, side, participant)."""
     event = session.get(Event, event_id)
     start = event.start_time_utc if event else None
 
-    row = FeatureRow(event_id=event_id, market=market, side=side, start_time_utc=start)
+    row = FeatureRow(
+        event_id=event_id,
+        market=market,
+        side=side,
+        participant_name=participant_name,
+        participant_entity_type=participant_entity_type,
+        participant_team_id=participant_team_id,
+        participant_player_id=participant_player_id,
+        start_time_utc=start,
+    )
     if event and event.league:
         row.league_key = event.league.key
         try:
@@ -306,7 +372,16 @@ def build_features(
             row.sport = event.league.key
 
     # ── Odds snapshots ──────────────────────────────────────────
-    ss = get_snapshot_set(session, event_id, market, side)
+    ss = get_snapshot_set(
+        session,
+        event_id,
+        market,
+        side,
+        participant_name,
+        participant_entity_type,
+        participant_team_id,
+        participant_player_id,
+    )
 
     for anchor_name, snap in [
         ("OPEN", ss.OPEN), ("T60", ss.T60), ("T30", ss.T30), ("CLOSE", ss.CLOSE),
@@ -318,7 +393,18 @@ def build_features(
 
     # ── Vig-removed fair probabilities ──────────────────────────
     # Query the opposite side at each anchor to normalize the overround.
-    _fill_fair_implied(session, row, event_id, market, side, ss)
+    _fill_fair_implied(
+        session,
+        row,
+        event_id,
+        market,
+        side,
+        ss,
+        participant_name,
+        participant_entity_type,
+        participant_team_id,
+        participant_player_id,
+    )
 
     # Movement deltas
     row.d_implied_OPEN_T60 = _safe_delta(row.implied_OPEN, row.implied_T60)
@@ -362,7 +448,15 @@ def build_features(
     # ── Volatility ──────────────────────────────────────────────
     if start:
         row.std_implied, row.n_price_changes, row.max_implied_drawdown = _compute_volatility(
-            session, event_id, market, side, start
+            session,
+            event_id,
+            market,
+            side,
+            start,
+            participant_name,
+            participant_entity_type,
+            participant_team_id,
+            participant_player_id,
         )
 
     # ── KenPom features (§4) ───────────────────────────────────
@@ -441,6 +535,10 @@ def _fill_fair_implied(
     market: str,
     side: str,
     ss: SnapshotSet,
+    participant_name: str | None = None,
+    participant_entity_type: str | None = None,
+    participant_team_id: int | None = None,
+    participant_player_id: int | None = None,
 ) -> None:
     """
     Compute vig-removed fair implied probabilities at each anchor.
@@ -456,7 +554,16 @@ def _fill_fair_implied(
         return
 
     # Get opposite side's snapshots
-    opp_ss = get_snapshot_set(session, event_id, market, opp_side)
+    opp_ss = get_snapshot_set(
+        session,
+        event_id,
+        market,
+        opp_side,
+        participant_name,
+        participant_entity_type,
+        participant_team_id,
+        participant_player_id,
+    )
 
     for anchor_name, this_snap, opp_snap in [
         ("OPEN", ss.OPEN, opp_ss.OPEN),
@@ -580,6 +687,7 @@ def _fill_mlb_features(
     from dk_ncaab.db.models import (
         MlbPlayerGameLog,
         MlbProbableStarter,
+        MlbStatcastDaily,
         MlbTeamGameLog,
     )
 
@@ -661,13 +769,130 @@ def _fill_mlb_features(
         if logs:
             setattr(row, f"{prefix}_mlb_starter_k_bb_l3", float(strikeouts - walks))
 
+        statcast_logs = list(
+            session.execute(
+                select(MlbStatcastDaily)
+                .where(
+                    MlbStatcastDaily.player_id == starter.player_id,
+                    MlbStatcastDaily.player_type == "pitcher",
+                    MlbStatcastDaily.game_date_utc < as_of_utc,
+                )
+                .order_by(MlbStatcastDaily.game_date_utc.desc(), MlbStatcastDaily.id.desc())
+                .limit(3)
+            ).scalars()
+        )
+        setattr(
+            row,
+            f"{prefix}_mlb_starter_statcast_whiff_rate_l3",
+            _avg([g.whiff_rate for g in statcast_logs]),
+        )
+        setattr(
+            row,
+            f"{prefix}_mlb_starter_statcast_csw_rate_l3",
+            _avg([g.csw_rate for g in statcast_logs]),
+        )
+        setattr(
+            row,
+            f"{prefix}_mlb_starter_statcast_hard_hit_rate_l3",
+            _avg([g.hard_hit_rate for g in statcast_logs]),
+        )
+
     set_starter_side("home", event.home_team_id)
     set_starter_side("away", event.away_team_id)
 
+    if row.participant_player_id is not None and row.market in (
+        "pitcher_strikeouts",
+        "batter_hits",
+        "batter_total_bases",
+    ):
+        player_type = "pitcher" if row.market == "pitcher_strikeouts" else "batter"
+        limit = 3 if player_type == "pitcher" else 5
+        statcast_logs = list(
+            session.execute(
+                select(MlbStatcastDaily)
+                .where(
+                    MlbStatcastDaily.player_id == row.participant_player_id,
+                    MlbStatcastDaily.player_type == player_type,
+                    MlbStatcastDaily.game_date_utc < as_of_utc,
+                )
+                .order_by(MlbStatcastDaily.game_date_utc.desc(), MlbStatcastDaily.id.desc())
+                .limit(limit)
+            ).scalars()
+        )
+        if player_type == "pitcher":
+            row.participant_statcast_pitcher_whiff_rate_l3 = _avg(
+                [g.whiff_rate for g in statcast_logs]
+            )
+            row.participant_statcast_pitcher_csw_rate_l3 = _avg(
+                [g.csw_rate for g in statcast_logs]
+            )
+            row.participant_statcast_pitcher_pitches_l3 = _avg(
+                [g.pitches for g in statcast_logs]
+            )
+        else:
+            row.participant_statcast_xba_l5 = _avg([g.xba_mean for g in statcast_logs])
+            row.participant_statcast_xslg_l5 = _avg([g.xslg_mean for g in statcast_logs])
+            row.participant_statcast_hard_hit_rate_l5 = _avg(
+                [g.hard_hit_rate for g in statcast_logs]
+            )
+            row.participant_statcast_barrel_rate_l5 = _avg(
+                [g.barrel_rate for g in statcast_logs]
+            )
+
 
 def _fill_outcomes(session: Session, row: FeatureRow, event: Event | None) -> None:
-    """Populate outcome labels from event_results."""
-    if not event or not event.result:
+    """Populate outcome labels from event_results or game logs."""
+    if not event:
+        return
+
+    # Team Totals & Player Props settlement for MLB
+    if row.sport == "baseball_mlb" and row.market in ("team_totals", "pitcher_strikeouts", "batter_hits", "batter_total_bases") and row.participant_name:
+        from dk_ncaab.db.models import MlbTeamGameLog, MlbPlayerGameLog, Player, Team
+
+        # We need the result logic specific to the market
+        if row.market == "team_totals":
+            if row.participant_team_id is not None:
+                team = session.get(Team, row.participant_team_id)
+            else:
+                team = session.query(Team).filter(
+                    Team.id.in_([event.home_team_id, event.away_team_id]),
+                    Team.name == row.participant_name,
+                ).first()
+            if team:
+                log = session.query(MlbTeamGameLog).filter(
+                    MlbTeamGameLog.event_id == event.id,
+                    MlbTeamGameLog.team_id == team.id
+                ).first()
+                if log and log.runs_for is not None:
+                    _settle_totals(row, log.runs_for)
+            return
+
+        elif row.market in ("pitcher_strikeouts", "batter_hits", "batter_total_bases"):
+            if row.participant_player_id is not None:
+                player = session.get(Player, row.participant_player_id)
+            else:
+                player = session.query(Player).filter(Player.full_name == row.participant_name).first()
+            if player:
+                log = session.query(MlbPlayerGameLog).filter(
+                    MlbPlayerGameLog.event_id == event.id,
+                    MlbPlayerGameLog.player_id == player.id
+                ).first()
+                if log:
+                    if row.market == "pitcher_strikeouts" and log.pitching_strike_outs is not None:
+                        _settle_totals(row, log.pitching_strike_outs)
+                    elif row.market == "batter_hits" and log.hits is not None:
+                        _settle_totals(row, log.hits)
+                    elif row.market == "batter_total_bases" and log.hits is not None:
+                        doubles = log.doubles or 0
+                        triples = log.triples or 0
+                        home_runs = log.home_runs or 0
+                        singles = max(int(log.hits) - doubles - triples - home_runs, 0)
+                        total_bases = singles + (2 * doubles) + (3 * triples) + (4 * home_runs)
+                        _settle_totals(row, total_bases)
+            return
+
+    # Standard Event-Level Settlement (Spreads, Game Totals, Moneylines)
+    if not event.result:
         return
 
     res = event.result
@@ -702,4 +927,24 @@ def _fill_outcomes(session: Session, row: FeatureRow, event: Event | None) -> No
     # moved spread/total lines settle at the actual entry line.
     row.spread_cover = row.spread_cover_CLOSE
     row.spread_cover_entry = row.spread_cover_OPEN
+    row.total_over = row.total_over_CLOSE
+
+def _settle_totals(row: FeatureRow, actual_total: int) -> None:
+    """Helper to populate total_over anchor metrics based on an actual total value."""
+    for anchor in ("OPEN", "T60", "T30", "CLOSE"):
+        line = getattr(row, f"line_{anchor}", None)
+        if line is None:
+            continue
+
+        if actual_total == line:
+            outcome = None
+        elif row.side == "over":
+            outcome = int(actual_total > line)
+        elif row.side == "under":
+            outcome = int(actual_total < line)
+        else:
+            outcome = None
+
+        setattr(row, f"total_over_{anchor}", outcome)
+
     row.total_over = row.total_over_CLOSE

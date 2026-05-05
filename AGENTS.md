@@ -33,7 +33,7 @@ Build a privately hosted, low-resource sports betting data website for NCAAB fir
 - `ui/`: Streamlit dashboard pages.
 - `scripts/`: VM, cron, deployment, diagnostics, and operational helpers.
 - `plans/`: roadmap and cloud/VM orchestration plans.
-- `.codex/skills/sportsbook-ui-designer/`: repo-local UI subagent skill for dashboard design iteration.
+- `.github/skills/sportsbook-ui-designer/`: repo-local UI subagent skill for dashboard design iteration.
 
 ## Sportsbook Board
 
